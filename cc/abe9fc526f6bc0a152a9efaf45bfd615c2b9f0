@@ -1,0 +1,22 @@
+src/commands/checkpoint_agent/presets/claude.rs
+  s_c5ca59844f9bf1::t_f7c08f4c5a4694 334-336
+  s_c5ca59844f9bf1::t_025553e7763a7a 348
+  s_c5ca59844f9bf1::t_5c8bdead22f62f 328
+  s_c5ca59844f9bf1::t_06ec7b922f3085 69,109,116,120,129,329-333,337-347,349-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ccabe9fc526f6bc0a152a9efaf45bfd615c2b9f0",
+  "prompts": {},
+  "sessions": {
+    "s_c5ca59844f9bf1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d5c2b6eb-8bbb-484c-8c06-ca2309e31e76",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
