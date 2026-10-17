@@ -258,6 +258,15 @@ struct DiffComputation {
     substantive_new_ranges: Vec<(usize, usize)>,
 }
 
+// A span = one contiguous edit. Can either be deleted and/or inserted bytes with no unchanged bytes in between,
+// or unchanged bytes with no deletions or insertions in between. Spans are represented as byte offsets into the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSegment {
+    pub old_range: (usize, usize),
+    pub new_range: (usize, usize),
+    pub changed: bool,
+}
+
 /// Configuration for the attribution tracker
 pub struct AttributionConfig {
     move_lines_threshold: usize,
@@ -602,6 +611,17 @@ impl AttributionTracker {
 
         // Phase 5: Merge and clean up
         Ok(self.merge_attributions(new_attributions))
+    }
+
+    // Minimum contiguous edits between two contents, using token-aligned diffing.
+    // Pass false for the AI flag to avoid coarse whole line splits
+    pub fn compute_diff_segments(
+        &self,
+        old_content: &str,
+        new_content: &str,
+    ) -> Result<Vec<DiffSegment>, GitAiError> {
+        let diff_result = self.compute_diffs(old_content, new_content, false)?;
+        Ok(diff_segments_from_diffs(&diff_result.diffs))
     }
 
     fn should_skip_move_detection(
@@ -1150,6 +1170,58 @@ impl AttributionTracker {
 
         merged
     }
+}
+
+/// Group consecutive Delete/Insert pieces into spans
+fn diff_segments_from_diffs(diffs: &[ByteDiff]) -> Vec<DiffSegment> {
+    let mut segments: Vec<DiffSegment> = Vec::new();
+    let mut old_pos = 0;
+    let mut new_pos = 0;
+
+    for diff in diffs {
+        let len: usize = diff.data().len();
+        let changed = diff.op() != ByteDiffOp::Equal;
+        let (old_len, new_len) = match diff.op() {
+            ByteDiffOp::Equal => (len, len),
+            ByteDiffOp::Delete => (len, 0),
+            ByteDiffOp::Insert => (0, len),
+        };
+        match segments.last_mut() {
+            Some(last) if last.changed == changed => {
+                last.old_range.1 += old_len;
+                last.new_range.1 += new_len;
+            }
+            _ => segments.push(DiffSegment {
+                old_range: (old_pos, old_pos + old_len),
+                new_range: (new_pos, new_pos + new_len),
+                changed,
+            }),
+        }
+        old_pos += old_len;
+        new_pos += new_len;
+    }
+    segments
+}
+
+// Compute where the bytes of the old range survive in the new file from the diff segments.
+// Returns a vector of new file ranges that correspond to the old range.
+// Only unchanged segments are considered. Parts inside changed segments are gone.
+pub fn surviving_ranges(
+    segments: &[DiffSegment],
+    old_range: (usize, usize),
+) -> Vec<(usize, usize)> {
+    segments
+        .iter()
+        .filter(|segment| !segment.changed)
+        .filter_map(|segment| {
+            let start = segment.old_range.0.max(old_range.0);
+            let end = segment.old_range.1.min(old_range.1);
+            (start < end).then(|| {
+                let new_start = segment.new_range.0 + (start - segment.old_range.0);
+                (new_start, new_start + (end - start))
+            })
+        })
+        .collect()
 }
 
 fn line_span_for_op(op: &DiffOp, for_old: bool) -> (usize, usize) {
@@ -2703,5 +2775,141 @@ mod tests {
         assert_eq!(metadata.len(), 2);
         assert_eq!(metadata[0].text, "hello");
         assert_eq!(metadata[1].text, "world");
+    }
+
+    fn segment(old_range: (usize, usize), new_range: (usize, usize), changed: bool) -> DiffSegment {
+        DiffSegment {
+            old_range,
+            new_range,
+            changed,
+        }
+    }
+
+    fn sample_segments() -> Vec<DiffSegment> {
+        vec![
+            segment((0, 10), (0, 10), false),
+            segment((10, 10), (10, 15), true),
+            segment((10, 22), (15, 27), false),
+            segment((22, 25), (27, 27), true),
+            segment((25, 45), (27, 47), false),
+        ]
+    }
+
+    #[test]
+    fn diff_segments_replace_inside_line_is_minimal() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments(
+                "let total = price * qty;\n",
+                "let total = price * quantity;\n",
+            )
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                segment((0, 20), (0, 20), false),
+                segment((20, 23), (20, 28), true),
+                segment((23, 25), (28, 30), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_segments_pure_insert_has_empty_old_range() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments("a\nc\n", "a\nb\nc\n")
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                segment((0, 2), (0, 2), false),
+                segment((2, 2), (2, 4), true),
+                segment((2, 4), (4, 6), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_segments_pure_delete_has_empty_new_range() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments("a\nb\nc\n", "a\nc\n")
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                segment((0, 2), (0, 2), false),
+                segment((2, 4), (2, 2), true),
+                segment((4, 6), (2, 4), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_segments_separate_edits_stay_separate() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments("one two three four five\n", "ONE two three four FIVE\n")
+            .unwrap();
+        let changed = segments.iter().filter(|segment| segment.changed).count();
+        assert_eq!(
+            changed, 2,
+            "unchanged text between edits must split them: {:?}",
+            segments
+        );
+    }
+
+    #[test]
+    fn diff_segments_identical_content_is_one_unchanged_segment() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker.compute_diff_segments("same\n", "same\n").unwrap();
+        assert_eq!(segments, vec![segment((0, 5), (0, 5), false)]);
+    }
+
+    #[test]
+    fn diff_segments_use_byte_offsets_for_multibyte_text() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments("\u{e9} x\n", "\u{e9} y\n")
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                segment((0, 3), (0, 3), false),
+                segment((3, 5), (3, 5), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn surviving_ranges_splits_around_deleted_bytes() {
+        assert_eq!(
+            surviving_ranges(&sample_segments(), (20, 28)),
+            vec![(25, 27), (27, 30)]
+        );
+    }
+
+    #[test]
+    fn surviving_ranges_shifts_untouched_range() {
+        assert_eq!(
+            surviving_ranges(&sample_segments(), (12, 15)),
+            vec![(17, 20)]
+        );
+    }
+
+    #[test]
+    fn surviving_ranges_fully_deleted_range_is_empty() {
+        assert!(surviving_ranges(&sample_segments(), (22, 25)).is_empty());
+    }
+
+    #[test]
+    fn surviving_ranges_end_to_end_through_diff() {
+        let tracker = AttributionTracker::new();
+        let segments = tracker
+            .compute_diff_segments("aaa bbb ccc\n", "aaa XXX ccc\n")
+            .unwrap();
+        assert_eq!(surviving_ranges(&segments, (8, 11)), vec![(8, 11)]);
+        assert!(surviving_ranges(&segments, (4, 7)).is_empty());
     }
 }
