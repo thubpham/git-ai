@@ -1,0 +1,27 @@
+notes/diagrams/claude-code-transcript-fields.md
+  s_c5ca59844f9bf1::t_5ecfa48de9ba18 1-663
+notes/DAILY_UPDATE.md
+  s_c5ca59844f9bf1::t_58981315de248b 1-52
+notes/TRR_OPEN_ITEMS.md
+  s_c5ca59844f9bf1::t_5e64913c066638 1-61
+notes/TRR_WORKLOG.md
+  s_c5ca59844f9bf1::t_178d9233a3165b 1-74
+notes/diagrams/edit-capture-flow.md
+  s_c5ca59844f9bf1::t_851511f039d11a 1-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "addc805d7a3fd71bacd9fe8fa002195242d7bc07",
+  "prompts": {},
+  "sessions": {
+    "s_c5ca59844f9bf1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d5c2b6eb-8bbb-484c-8c06-ca2309e31e76",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
