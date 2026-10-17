@@ -1,0 +1,14 @@
+src/authorship/attribution_tracker.rs
+  h_e28b5b544faa1b 261-269,616-626,1175-1226,2779-2914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "293b70117f0d56eef40f9a66d9d5a1f8f9122d6a",
+  "prompts": {},
+  "humans": {
+    "h_e28b5b544faa1b": {
+      "author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
