@@ -1,0 +1,52 @@
+src/token_usage/mod.rs
+  s_5b72a8e7470db8::t_be44dfcf50368b 18
+  s_5b72a8e7470db8::t_d9f4a4e99a079e 13
+src/commands/checkpoint_agent/presets/claude.rs
+  s_5b72a8e7470db8::t_84e615a2673f7d 73-74
+  s_5b72a8e7470db8::t_269efcbd675da4 77,205-251
+  s_5b72a8e7470db8::t_fae1f969d0877e 75-76
+  s_5b72a8e7470db8::t_493eed884adf34 78
+  s_5b72a8e7470db8::t_e744a692893e03 95
+tests/integration/token_usage.rs
+  s_5b72a8e7470db8::t_be44dfcf50368b 704-844,893-898
+  s_5b72a8e7470db8::t_54c20da8fa5841 668-703,899
+src/daemon/token_usage_worker.rs
+  s_5b72a8e7470db8::t_be44dfcf50368b 1242
+  s_5b72a8e7470db8::t_533e8c5be8dc87 1183,1210,1224,1227
+src/daemon.rs
+  s_5b72a8e7470db8::t_be44dfcf50368b 10767-10769,10773-10777
+  s_5b72a8e7470db8::t_f95adedff3a870 10770-10772
+src/token_usage/db.rs
+  s_5b72a8e7470db8::t_bcd35fcb484378 558,564-574
+  s_5b72a8e7470db8::t_d579aeabaf3bdc 598
+  s_5b72a8e7470db8::t_c896d1508acf99 43
+  s_5b72a8e7470db8::t_be44dfcf50368b 45
+  s_5b72a8e7470db8::t_3a891fdf59e9d3 500,545
+  s_5b72a8e7470db8::t_cc9ecb2ee218ce 504-541
+  s_5b72a8e7470db8::t_971a995dfebc9e 575
+src/token_usage/facts_db.rs
+  s_5b72a8e7470db8::t_1f86632f29b590 1-9,11-63,65-564
+  s_5b72a8e7470db8::t_be44dfcf50368b 10,64
+src/token_usage/claude.rs
+  s_5b72a8e7470db8::t_a20903c46372f8 23,33-36,40,44-46,49-69,441,451,456-526,785,816
+src/token_usage/claude_facts.rs
+  s_5b72a8e7470db8::t_114cc946489b44 1-507
+src/token_usage/extractor.rs
+  s_5b72a8e7470db8::t_b4dc95fa86fe00 5,40-43,100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "33c358616105f177b48802d26dfb9ce2b99f89bd",
+  "prompts": {},
+  "sessions": {
+    "s_5b72a8e7470db8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "731d1c37-4230-4872-ab3c-69e0061b7907",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
