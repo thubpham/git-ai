@@ -10764,6 +10764,17 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
                 let token_usage_handle = if token_usage_enabled {
                     match crate::token_usage::db::TokenUsageDatabase::open(&token_usage_db_path) {
                         Ok(token_db) => {
+                            let token_db = match crate::token_usage::facts_db::FactsDatabase::open(
+                                config.internal_dir.join("transcript-facts-db"),
+                            ) {
+                                Ok(facts_db) => {
+                                    token_db.with_facts_db(std::sync::Arc::new(facts_db))
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "failed to open transcript-facts database, call and turn facts will not be recorded");
+                                    token_db
+                                }
+                            };
                             Some(crate::daemon::token_usage_worker::spawn_token_usage_worker(
                                 streams_db.clone(),
                                 std::sync::Arc::new(token_db),

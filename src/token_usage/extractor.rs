@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::claude_facts::TranscriptFact;
 use super::types::{Speed, UsageEntry};
 
 /// A forked session's request for its parent's pre-fork usage history: the
@@ -35,6 +36,10 @@ pub trait UsageExtractor: Send {
 
     /// Consume one raw JSONL line, returning any usage entries it completes.
     fn extract_line(&mut self, line: &str) -> Vec<UsageEntry>;
+
+    fn extract_facts(&mut self, _line: &str) -> Vec<TranscriptFact> {
+        Vec::new()
+    }
 
     /// Inject the configuration-derived speed for entries whose transcript
     /// records no service tier (Codex `~/.codex/config.toml`). Resolved by
@@ -92,7 +97,7 @@ pub trait UsageExtractor: Send {
 /// Extractor for the given git-ai tool id, if token usage is supported.
 pub fn extractor_for_tool(tool: &str) -> Option<Box<dyn UsageExtractor>> {
     match tool {
-        "claude" => Some(Box::new(super::claude::ClaudeUsageExtractor)),
+        "claude" => Some(Box::new(super::claude::ClaudeUsageExtractor::default())),
         "codex" => Some(Box::new(super::codex::CodexUsageExtractor::default())),
         _ => None,
     }

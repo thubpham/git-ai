@@ -40,7 +40,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::claude::{ReplacementCandidate, should_replace};
+use super::claude_facts::TranscriptFact;
 use super::cost::price_entry;
+use super::facts_db::FactsDatabase;
 use super::types::{Speed, UsageEntry, bucket_ts};
 use crate::error::GitAiError;
 
@@ -495,13 +497,52 @@ const TOKEN_VALUE_CEILING: u64 = 1_000_000_000_000;
 
 /// Clamp a token count for an INTEGER column (defensive: corrupt transcripts
 /// can carry absurd values).
-fn to_db_i64(value: u64) -> i64 {
+pub(super) fn to_db_i64(value: u64) -> i64 {
     value.min(TOKEN_VALUE_CEILING) as i64
+}
+
+pub(super) fn run_migrations(
+    conn: &Connection,
+    migrations: &[&str],
+    name: &str,
+) -> Result<(), GitAiError> {
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? > 0),
+    )?;
+    let current_version: u32 = if table_exists {
+        conn.query_row(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    if current_version > migrations.len() as u32 {
+        return Err(GitAiError::Generic(format!(
+            "{name} database schema v{current_version} is newer than this binary \
+             (supports up to v{}); upgrade git-ai",
+            migrations.len()
+        )));
+    }
+    for (version, migration_sql) in migrations.iter().enumerate() {
+        if current_version < (version + 1) as u32 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(migration_sql)?;
+            tx.commit()?;
+        }
+    }
+    Ok(())
 }
 
 /// SQLite database for token-usage state.
 pub struct TokenUsageDatabase {
     conn: Arc<Mutex<Connection>>,
+    facts: Option<Arc<FactsDatabase>>,
 }
 
 impl TokenUsageDatabase {
@@ -514,9 +555,22 @@ impl TokenUsageDatabase {
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            facts: None,
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    pub fn with_facts_db(mut self, facts: Arc<FactsDatabase>) -> Self {
+        self.facts = Some(facts);
+        self
+    }
+
+    pub fn commit_facts(&self, facts: &[TranscriptFact]) -> Result<(), GitAiError> {
+        match &self.facts {
+            Some(facts_db) if !facts.is_empty() => facts_db.commit_facts(facts),
+            _ => Ok(()),
+        }
     }
 
     /// Best-effort removal of the database files (main + WAL/SHM). Used when
@@ -541,46 +595,7 @@ impl TokenUsageDatabase {
     }
 
     fn migrate(&self) -> Result<(), GitAiError> {
-        let conn = self.lock();
-        let table_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
-            [],
-            |row| Ok(row.get::<_, i64>(0)? > 0),
-        )?;
-        let current_version: u32 = if table_exists {
-            conn.query_row(
-                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0)
-        } else {
-            0
-        };
-        // A database from a NEWER binary must fail closed here: migrations
-        // are destructive from v3 on (columns renamed/dropped), so a
-        // downgraded daemon would otherwise open fine and then fail every
-        // pass at runtime on missing columns, churning error backoff.
-        if current_version > MIGRATIONS.len() as u32 {
-            return Err(GitAiError::Generic(format!(
-                "token-usage database schema v{current_version} is newer than this binary \
-                 (supports up to v{}); upgrade git-ai or delete the database",
-                MIGRATIONS.len()
-            )));
-        }
-        for (version, migration_sql) in MIGRATIONS.iter().enumerate() {
-            if current_version < (version + 1) as u32 {
-                // Each migration commits atomically: a crash between the
-                // statements of a partially applied script (e.g. after one
-                // ALTER but before the version row) would otherwise make
-                // every later open() fail forever on re-application.
-                let tx = conn.unchecked_transaction()?;
-                tx.execute_batch(migration_sql)?;
-                tx.commit()?;
-            }
-        }
-        Ok(())
+        run_migrations(&self.lock(), MIGRATIONS, "token-usage")
     }
 
     /// Current schema version (for tests).

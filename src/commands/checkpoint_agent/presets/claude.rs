@@ -70,6 +70,12 @@ impl AgentPreset for ClaudePreset {
 
         let is_bash = tool_class == ToolClass::Bash;
 
+        let mut metadata =
+            HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]);
+        if let Some(prompt_id) = parse::optional_str(&data, "prompt_id") {
+            metadata.insert("prompt_id".to_string(), prompt_id.to_string());
+        }
+
         let context = PresetContext {
             agent_id: AgentId {
                 tool: "claude".to_string(),
@@ -86,7 +92,7 @@ impl AgentPreset for ClaudePreset {
             external_session_id: session_id.clone(),
             trace_id: trace_id.to_string(),
             cwd: PathBuf::from(cwd),
-            metadata: HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]),
+            metadata,
         };
 
         let transcript_path_buf = PathBuf::from(transcript_path);
@@ -193,6 +199,53 @@ mod tests {
                 }
             }
             _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_claude_prompt_id_is_carried_in_metadata() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(&make_claude_hook_input("PostToolUse", "Write")).unwrap();
+        input["prompt_id"] = json!("550e8400-e29b-41d4-a716-446655440000");
+        let events = ClaudePreset
+            .parse(&input.to_string(), "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => assert_eq!(
+                e.context.metadata.get("prompt_id").map(String::as_str),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            ),
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_claude_without_prompt_id_has_no_prompt_id_metadata() {
+        let input = make_claude_hook_input("PostToolUse", "Write");
+        let events = ClaudePreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert!(!e.context.metadata.contains_key("prompt_id"));
+                assert!(e.context.metadata.contains_key("transcript_path"));
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_claude_prompt_id_is_carried_for_pre_bash_call() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(&make_claude_hook_input("PreToolUse", "Bash")).unwrap();
+        input["prompt_id"] = json!("prompt-1");
+        let events = ClaudePreset
+            .parse(&input.to_string(), "t_test123456789a")
+            .unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreBashCall(e) => assert_eq!(
+                e.context.metadata.get("prompt_id").map(String::as_str),
+                Some("prompt-1")
+            ),
+            _ => panic!("Expected PreBashCall"),
         }
     }
 

@@ -10,10 +10,12 @@
 //! `claude.rs` and `codex.rs`.
 
 pub mod claude;
+pub mod claude_facts;
 pub mod codex;
 pub mod cost;
 pub mod db;
 pub mod extractor;
+pub mod facts_db;
 pub mod types;
 
 pub use extractor::{UsageExtractor, extractor_for_tool};
