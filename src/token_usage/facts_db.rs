@@ -108,6 +108,25 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (2);
     "#,
+    r#"
+    ALTER TABLE span ADD COLUMN prior_kind TEXT
+        CHECK (prior_kind IN ('ai', 'known_human', 'untracked', 'mixed', 'none'));
+    ALTER TABLE span ADD COLUMN edit_type TEXT
+        CHECK (edit_type IN ('add', 'replace'));
+
+    CREATE TABLE span_touch (
+        touch_id INTEGER PRIMARY KEY,
+        span_id TEXT NOT NULL,
+        touched_at INTEGER NOT NULL,
+        toucher_kind TEXT NOT NULL,
+        toucher_id TEXT NOT NULL,
+        touch_kind TEXT NOT NULL CHECK (touch_kind IN ('replace', 'delete')),
+        bytes_removed INTEGER NOT NULL
+    );
+    CREATE INDEX idx_span_touch_span ON span_touch(span_id);
+
+    INSERT INTO schema_version (version) VALUES (3);
+    "#,
 ];
 
 const CALL_UPSERT_SQL: &str = "
@@ -340,10 +359,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -373,11 +392,126 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
         assert_eq!(row_count(&db, "survival_measurement"), 0);
+    }
+
+    #[test]
+    fn a_v2_database_gains_edit_context_and_keeps_its_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+        }
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            conn.execute(
+                "INSERT INTO span (
+                    span_id, session_id, repo_key, file_path, author_kind, author_id,
+                    source, content_hash, created_at
+                 ) VALUES ('span-1', 's1', '/repo/.git', 'src/a.rs', 'ai', 'author-1',
+                           'file_edit', 'hash-1', 1000)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 3);
+        let stored: (Option<String>, Option<String>) = db
+            .lock()
+            .query_row(
+                "SELECT prior_kind, edit_type FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None));
+        assert_eq!(row_count(&db, "span_touch"), 0);
+    }
+
+    #[test]
+    fn a_span_records_what_it_replaced_and_how() {
+        let (_dir, db) = db();
+        insert_span(&db, "span-1").unwrap();
+
+        db.lock()
+            .execute(
+                "UPDATE span SET prior_kind = 'known_human', edit_type = 'replace'
+                 WHERE span_id = 'span-1'",
+                [],
+            )
+            .unwrap();
+
+        let stored: (String, String) = db
+            .lock()
+            .query_row(
+                "SELECT prior_kind, edit_type FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("known_human".to_string(), "replace".to_string()));
+    }
+
+    #[test]
+    fn unknown_prior_kinds_and_edit_types_are_rejected() {
+        let (_dir, db) = db();
+        insert_span(&db, "span-1").unwrap();
+
+        let set = |column: &str, value: &str| {
+            db.lock().execute(
+                &format!("UPDATE span SET {column} = ?1 WHERE span_id = 'span-1'"),
+                params![value],
+            )
+        };
+
+        assert!(set("prior_kind", "robot").is_err());
+        assert!(set("edit_type", "move").is_err());
+        for kind in ["ai", "known_human", "untracked", "mixed", "none"] {
+            set("prior_kind", kind).unwrap();
+        }
+        for edit_type in ["add", "replace"] {
+            set("edit_type", edit_type).unwrap();
+        }
+    }
+
+    fn insert_touch(
+        db: &FactsDatabase,
+        span_id: &str,
+        touch_kind: &str,
+    ) -> rusqlite::Result<usize> {
+        db.lock().execute(
+            "INSERT INTO span_touch (
+                span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
+             ) VALUES (?1, 2000, 'known_human', 'human-1', ?2, 40)",
+            params![span_id, touch_kind],
+        )
+    }
+
+    #[test]
+    fn a_span_keeps_every_touch_made_to_it() {
+        let (_dir, db) = db();
+
+        insert_touch(&db, "span-1", "replace").unwrap();
+        insert_touch(&db, "span-1", "replace").unwrap();
+        insert_touch(&db, "span-1", "delete").unwrap();
+
+        assert_eq!(row_count(&db, "span_touch"), 3);
+    }
+
+    #[test]
+    fn a_touch_is_either_a_replace_or_a_delete() {
+        let (_dir, db) = db();
+
+        assert!(insert_touch(&db, "span-1", "add").is_err());
+        assert_eq!(row_count(&db, "span_touch"), 0);
     }
 
     #[test]
