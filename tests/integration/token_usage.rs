@@ -699,7 +699,7 @@ fn claude_call_line(
 }
 
 fn token_usage_db(repo: &TestRepo) -> rusqlite::Connection {
-    rusqlite::Connection::open_with_flags(
+    git_ai::sqlite::open_with_flags_and_memory_limits(
         repo.test_home_path()
             .join(".git-ai/internal/transcript-facts-db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

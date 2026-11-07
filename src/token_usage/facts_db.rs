@@ -209,6 +209,10 @@ mod tests {
     use super::*;
     use crate::token_usage::claude_facts::AdvisorFact;
 
+    fn call_of(fact: CallFact) -> TranscriptFact {
+        TranscriptFact::Call(Box::new(fact))
+    }
+
     fn db() -> (tempfile::TempDir, FactsDatabase) {
         let dir = tempfile::tempdir().unwrap();
         let db = FactsDatabase::open(dir.path().join("transcript-facts-db")).unwrap();
@@ -342,8 +346,7 @@ mod tests {
             ..Default::default()
         };
 
-        db.commit_facts(&[TranscriptFact::Call(fact.clone())])
-            .unwrap();
+        db.commit_facts(&[call_of(fact.clone())]).unwrap();
 
         assert_eq!(read_call(&db, "req-1"), fact);
     }
@@ -370,17 +373,11 @@ mod tests {
 
         let (_dir_a, forward) = db();
         forward
-            .commit_facts(&[
-                TranscriptFact::Call(thinking.clone()),
-                TranscriptFact::Call(tool_use.clone()),
-            ])
+            .commit_facts(&[call_of(thinking.clone()), call_of(tool_use.clone())])
             .unwrap();
         let (_dir_b, backward) = db();
         backward
-            .commit_facts(&[
-                TranscriptFact::Call(tool_use),
-                TranscriptFact::Call(thinking),
-            ])
+            .commit_facts(&[call_of(tool_use), call_of(thinking)])
             .unwrap();
 
         assert_eq!(read_call(&forward, "req-1"), merged);
@@ -403,8 +400,7 @@ mod tests {
             ..call_fact("req-1")
         };
 
-        db.commit_facts(&[TranscriptFact::Call(first), TranscriptFact::Call(later)])
-            .unwrap();
+        db.commit_facts(&[call_of(first), call_of(later)]).unwrap();
 
         let stored = read_call(&db, "req-1");
         assert_eq!(stored.model.as_deref(), Some("first-model"));
@@ -415,7 +411,7 @@ mod tests {
     fn committing_the_same_facts_twice_adds_no_rows() {
         let (_dir, db) = db();
         let facts = vec![
-            TranscriptFact::Call(CallFact {
+            call_of(CallFact {
                 tool_use_ids: vec!["toolu_1".to_string(), "toolu_2".to_string()],
                 advisor_uses: vec![AdvisorFact {
                     index: 0,
@@ -456,8 +452,7 @@ mod tests {
             ..call_fact("req-2")
         };
 
-        db.commit_facts(&[TranscriptFact::Call(fact), TranscriptFact::Call(other)])
-            .unwrap();
+        db.commit_facts(&[call_of(fact), call_of(other)]).unwrap();
 
         let request_for = |tool_use_id: &str| -> String {
             db.lock()
@@ -493,8 +488,7 @@ mod tests {
             ..call_fact("req-2")
         };
 
-        db.commit_facts(&[TranscriptFact::Call(first), TranscriptFact::Call(second)])
-            .unwrap();
+        db.commit_facts(&[call_of(first), call_of(second)]).unwrap();
 
         assert_eq!(row_count(&db, "advisor_use"), 3);
         let input_tokens = |request_id: &str, index: u32| -> i64 {
@@ -548,7 +542,7 @@ mod tests {
         let (_dir, db) = db();
         db.lock().execute_batch("DROP TABLE turn").unwrap();
         let facts = [
-            TranscriptFact::Call(call_fact("req-1")),
+            call_of(call_fact("req-1")),
             TranscriptFact::Turn(TurnFact {
                 prompt_id: "prompt-1".to_string(),
                 duration_ms: Some(1),

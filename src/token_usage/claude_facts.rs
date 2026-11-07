@@ -54,7 +54,7 @@ pub struct TurnFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptFact {
-    Call(CallFact),
+    Call(Box<CallFact>),
     Turn(TurnFact),
 }
 
@@ -81,7 +81,7 @@ impl ClaudeFactsParser {
             }
             Some("assistant") => self
                 .call_fact(&entry)
-                .map(TranscriptFact::Call)
+                .map(|call| TranscriptFact::Call(Box::new(call)))
                 .into_iter()
                 .collect(),
             Some("system") => self
@@ -244,7 +244,7 @@ mod tests {
 
     fn only_call(facts: Vec<TranscriptFact>) -> CallFact {
         match facts.into_iter().next() {
-            Some(TranscriptFact::Call(call)) => call,
+            Some(TranscriptFact::Call(call)) => *call,
             other => panic!("expected a call fact, got {other:?}"),
         }
     }
