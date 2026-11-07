@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rusqlite::{Connection, Transaction, named_params, params};
 
@@ -163,6 +163,16 @@ const CALL_UPSERT_SQL: &str = "
         timestamp = COALESCE(call.timestamp, excluded.timestamp),
         thinking_ms = COALESCE(call.thinking_ms, excluded.thinking_ms)";
 
+static SHARED: OnceLock<Arc<FactsDatabase>> = OnceLock::new();
+
+pub fn register_shared(db: Arc<FactsDatabase>) {
+    let _ = SHARED.set(db);
+}
+
+pub fn shared() -> Option<Arc<FactsDatabase>> {
+    SHARED.get().cloned()
+}
+
 pub struct FactsDatabase {
     conn: Arc<Mutex<Connection>>,
 }
@@ -283,6 +293,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = FactsDatabase::open(dir.path().join("transcript-facts-db")).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn the_shared_handle_is_empty_until_registered_and_keeps_the_first() {
+        assert!(shared().is_none());
+        let (_first_dir, first) = db();
+        let first = Arc::new(first);
+        register_shared(first.clone());
+        let (_second_dir, second) = db();
+
+        register_shared(Arc::new(second));
+
+        assert!(Arc::ptr_eq(&shared().unwrap(), &first));
     }
 
     fn call_fact(request_id: &str) -> CallFact {

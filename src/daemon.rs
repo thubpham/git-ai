@@ -10768,7 +10768,9 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
                                 config.internal_dir.join("transcript-facts-db"),
                             ) {
                                 Ok(facts_db) => {
-                                    token_db.with_facts_db(std::sync::Arc::new(facts_db))
+                                    let facts_db = std::sync::Arc::new(facts_db);
+                                    crate::token_usage::facts_db::register_shared(facts_db.clone());
+                                    token_db.with_facts_db(facts_db)
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, "failed to open transcript-facts database, call and turn facts will not be recorded");
