@@ -665,6 +665,183 @@ fn appended_transcript_lines_update_existing_buckets() {
     assert_eq!(value_u64(latest, token_usage_pos::MESSAGE_COUNT), Some(2));
 }
 
+fn claude_call_line(
+    uuid: &str,
+    request_id: &str,
+    ts: &str,
+    content: serde_json::Value,
+    thinking_ms: Option<u64>,
+) -> String {
+    let mut entry = json!({
+        "type": "assistant",
+        "uuid": uuid,
+        "requestId": request_id,
+        "timestamp": ts,
+        "sessionId": "ext",
+        "effort": "medium",
+        "message": {
+            "id": format!("msg-{request_id}"),
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "tool_use",
+            "content": content,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 200
+            }
+        }
+    });
+    if let Some(ms) = thinking_ms {
+        entry["thinkingDurationMs"] = json!(ms);
+    }
+    entry.to_string()
+}
+
+fn token_usage_db(repo: &TestRepo) -> rusqlite::Connection {
+    git_ai::sqlite::open_with_flags_and_memory_limits(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("transcript-facts database should exist")
+}
+
+#[test]
+fn claude_transcript_records_call_and_turn_facts_across_incremental_passes() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    repo.git(&["commit", "--allow-empty", "-m", "initial"])
+        .expect("initial commit should succeed");
+    let repo_root = repo.canonical_path();
+
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(
+        &transcript_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"type": "user", "promptId": "prompt-1", "message": {"content": "hello"}}),
+            claude_call_line(
+                "a-1",
+                "req-1",
+                &recent_ts(1, 0),
+                json!([{"type": "thinking"}]),
+                Some(900)
+            ),
+            claude_call_line(
+                "a-2",
+                "req-1",
+                &recent_ts(1, 1),
+                json!([{"type": "tool_use", "id": "toolu_edit_1"}]),
+                None
+            ),
+            json!({
+                "type": "system",
+                "subtype": "turn_duration",
+                "durationMs": 61000,
+                "messageCount": 3,
+                "timestamp": recent_ts(2, 0)
+            }),
+        ),
+    )
+    .unwrap();
+
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    checkpoint_with_transcript(
+        &repo,
+        "claude",
+        "sess-call-facts",
+        &transcript_path,
+        &file_path,
+        "const x = 1;\nconst y = 2;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let db = token_usage_db(&repo);
+    let call: (String, String, String, i64, i64) = db
+        .query_row(
+            "SELECT prompt_id, model, effort, thinking_ms, output_tokens
+             FROM call WHERE request_id = 'req-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        call,
+        (
+            "prompt-1".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "medium".to_string(),
+            900,
+            50
+        ),
+        "the thinking line and the tool_use line merge into one call row"
+    );
+    let tool_request: String = db
+        .query_row(
+            "SELECT request_id FROM call_tool_use WHERE tool_use_id = 'toolu_edit_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tool_request, "req-1");
+    let turn: (i64, i64) = db
+        .query_row(
+            "SELECT duration_ms, message_count FROM turn WHERE prompt_id = 'prompt-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(turn, (61000, 3));
+
+    let mut content = fs::read_to_string(&transcript_path).unwrap();
+    content.push_str(&claude_call_line(
+        "a-3",
+        "req-2",
+        &recent_ts(3, 0),
+        json!([{"type": "tool_use", "id": "toolu_edit_2"}]),
+        None,
+    ));
+    content.push('\n');
+    fs::write(&transcript_path, content).unwrap();
+    checkpoint_with_transcript(
+        &repo,
+        "claude",
+        "sess-call-facts",
+        &transcript_path,
+        &file_path,
+        "const x = 1;\nconst y = 2;\nconst z = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let db = token_usage_db(&repo);
+    let calls: i64 = db
+        .query_row("SELECT COUNT(*) FROM call", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(calls, 2, "re-reading adds only the appended call");
+    let later_prompt: String = db
+        .query_row(
+            "SELECT prompt_id FROM call WHERE request_id = 'req-2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        later_prompt, "prompt-1",
+        "the prompt id carries across passes through the persisted extractor state"
+    );
+}
+
 #[test]
 fn disabled_flag_spawns_nothing_and_deletes_collected_data() {
     let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
@@ -712,6 +889,13 @@ fn disabled_flag_spawns_nothing_and_deletes_collected_data() {
     assert!(
         !token_db_path.exists(),
         "token-usage database must not be created with the flag off"
+    );
+    assert!(
+        !repo
+            .test_home_path()
+            .join(".git-ai/internal/transcript-facts-db")
+            .exists(),
+        "transcript-facts database must not be created with the flag off"
     );
 }
 

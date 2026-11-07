@@ -1180,6 +1180,7 @@ fn process_file(
     let mut interrupted = false;
     while !reached_end && !interrupted {
         let mut entries = Vec::new();
+        let mut facts = Vec::new();
         let mut consumed = 0usize;
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
@@ -1206,6 +1207,7 @@ fn process_file(
                         offset += bytes as u64;
                         if extractor.wants_line(trimmed) {
                             entries.extend(extractor.extract_line(trimmed));
+                            facts.extend(extractor.extract_facts(trimmed));
                             serve_parent_request(&mut extractor);
                         }
                     }
@@ -1219,9 +1221,10 @@ fn process_file(
                     let trimmed = text.trim_end();
                     if extractor.wants_line(trimmed) {
                         entries.extend(extractor.extract_line(trimmed));
+                        facts.extend(extractor.extract_facts(trimmed));
                         serve_parent_request(&mut extractor);
                     }
-                    if entries.len() >= BATCH_MAX_ENTRIES
+                    if entries.len() + facts.len() >= BATCH_MAX_ENTRIES
                         || consumed >= BATCH_MAX_BYTES
                         || batch_started.elapsed() >= BATCH_MAX_SEGMENT
                     {
@@ -1236,6 +1239,7 @@ fn process_file(
             // turn).
             entries.extend(extractor.flush(now.saturating_mul(1000)));
         }
+        token_db.commit_facts(&facts)?;
         token_db.commit_batch(&BatchCommit {
             session_id: &identity.session_id,
             stream_path,

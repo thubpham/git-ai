@@ -20,6 +20,7 @@
 
 use serde::Deserialize;
 
+use super::claude_facts::{ClaudeFactsParser, TranscriptFact};
 use super::extractor::UsageExtractor;
 use super::types::{PricingShape, Speed, TokenCounts, UsageEntry, parse_rfc3339_secs};
 
@@ -29,15 +30,42 @@ pub const UNKNOWN_MODEL: &str = "unknown";
 /// Substring present on every JSONL line that carries token usage.
 const USAGE_MARKER: &str = r#""usage":{"#;
 
-pub struct ClaudeUsageExtractor;
+#[derive(Default)]
+pub struct ClaudeUsageExtractor {
+    facts: ClaudeFactsParser,
+}
 
 impl UsageExtractor for ClaudeUsageExtractor {
     fn wants_line(&self, line: &str) -> bool {
-        line.contains(USAGE_MARKER)
+        line.contains(USAGE_MARKER) || self.facts.wants_line(line)
     }
 
     fn extract_line(&mut self, line: &str) -> Vec<UsageEntry> {
+        if !line.contains(USAGE_MARKER) {
+            return Vec::new();
+        }
         extract_claude_line(line)
+    }
+
+    fn extract_facts(&mut self, line: &str) -> Vec<TranscriptFact> {
+        self.facts.parse_line(line)
+    }
+
+    fn state_json(&self) -> Option<String> {
+        serde_json::to_string(&self.facts).ok()
+    }
+
+    fn restore_state(&mut self, json: &str) -> bool {
+        match serde_json::from_str(json) {
+            Ok(facts) => {
+                self.facts = facts;
+                true
+            }
+            Err(_) => {
+                self.facts = ClaudeFactsParser::default();
+                false
+            }
+        }
     }
 }
 
@@ -410,7 +438,7 @@ mod tests {
     use super::*;
 
     fn extract(line: &str) -> Vec<UsageEntry> {
-        ClaudeUsageExtractor.extract_line(line)
+        ClaudeUsageExtractor::default().extract_line(line)
     }
 
     fn usage_line() -> String {
@@ -420,9 +448,80 @@ mod tests {
 
     #[test]
     fn prefilter_matches_usage_lines_only() {
-        let extractor = ClaudeUsageExtractor;
+        let extractor = ClaudeUsageExtractor::default();
         assert!(extractor.wants_line(&usage_line()));
         assert!(!extractor.wants_line(r#"{"type":"user","message":{"content":"hi"}}"#));
+    }
+
+    const PROMPT_LINE: &str = r#"{"type":"user","promptId":"prompt-1","message":{"content":"hi"}}"#;
+
+    fn assistant_fact_line() -> String {
+        r#"{"type":"assistant","requestId":"req-1","uuid":"a-1","timestamp":"2026-01-01T00:02:30.000Z","message":{"id":"msg-1","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"toolu_1"}],"usage":{"input_tokens":100,"output_tokens":50}}}"#
+            .to_string()
+    }
+
+    #[test]
+    fn prefilter_also_matches_prompt_and_turn_lines() {
+        let extractor = ClaudeUsageExtractor::default();
+        assert!(extractor.wants_line(PROMPT_LINE));
+        assert!(extractor.wants_line(r#"{"type":"system","subtype":"turn_duration"}"#));
+    }
+
+    #[test]
+    fn non_usage_lines_yield_no_usage_entries() {
+        let mut extractor = ClaudeUsageExtractor::default();
+        assert!(extractor.extract_line(PROMPT_LINE).is_empty());
+    }
+
+    #[test]
+    fn extractor_yields_facts_alongside_usage_entries() {
+        let mut extractor = ClaudeUsageExtractor::default();
+        extractor.extract_facts(PROMPT_LINE);
+        let line = assistant_fact_line();
+
+        let entries = extractor.extract_line(&line);
+        let facts = extractor.extract_facts(&line);
+
+        assert_eq!(entries.len(), 1);
+        match facts.as_slice() {
+            [TranscriptFact::Call(call)] => {
+                assert_eq!(call.request_id, "req-1");
+                assert_eq!(call.prompt_id.as_deref(), Some("prompt-1"));
+                assert_eq!(call.tool_use_ids, vec!["toolu_1".to_string()]);
+            }
+            other => panic!("expected one call fact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_id_survives_a_state_round_trip() {
+        let mut first = ClaudeUsageExtractor::default();
+        first.extract_facts(PROMPT_LINE);
+        let state = first.state_json().expect("claude extractor persists state");
+
+        let mut resumed = ClaudeUsageExtractor::default();
+        assert!(resumed.restore_state(&state));
+        let facts = resumed.extract_facts(&assistant_fact_line());
+
+        match facts.as_slice() {
+            [TranscriptFact::Call(call)] => {
+                assert_eq!(call.prompt_id.as_deref(), Some("prompt-1"))
+            }
+            other => panic!("expected one call fact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreadable_state_is_reported_and_resets_the_prompt() {
+        let mut extractor = ClaudeUsageExtractor::default();
+        extractor.extract_facts(PROMPT_LINE);
+
+        assert!(!extractor.restore_state("{\"prompt_id\": 42"));
+
+        match extractor.extract_facts(&assistant_fact_line()).as_slice() {
+            [TranscriptFact::Call(call)] => assert_eq!(call.prompt_id, None),
+            other => panic!("expected one call fact, got {other:?}"),
+        }
     }
 
     #[test]
@@ -683,7 +782,7 @@ mod tests {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/example-claude-code.jsonl");
         let content = std::fs::read_to_string(fixture).unwrap();
-        let mut extractor = ClaudeUsageExtractor;
+        let mut extractor = ClaudeUsageExtractor::default();
         let mut entries = Vec::new();
         for line in content.lines() {
             if extractor.wants_line(line) {
@@ -714,7 +813,7 @@ mod tests {
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
             let content = std::fs::read_to_string(path).unwrap();
-            let mut extractor = ClaudeUsageExtractor;
+            let mut extractor = ClaudeUsageExtractor::default();
             let mut count = 0;
             for line in content.lines() {
                 if extractor.wants_line(line) {
