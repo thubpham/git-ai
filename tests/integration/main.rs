@@ -57,6 +57,7 @@ mod debug_diagnostics;
 mod diff;
 mod diff_comprehensive;
 mod diff_ignore_binary;
+mod diff_segments_benchmarks;
 mod droid;
 mod e2big_post_filter;
 mod e2e_user_scenarios;
