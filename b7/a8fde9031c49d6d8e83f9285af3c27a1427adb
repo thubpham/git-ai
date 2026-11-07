@@ -1,0 +1,26 @@
+benchmark/diff_segments_benchmarks/README.md
+  s_5b72a8e7470db8::t_86043874356c46 51
+  s_5b72a8e7470db8::t_6471c4b04b19ca 1-4,6-50,52-57,59-64
+  s_5b72a8e7470db8::t_2da959adaecdcd 5
+  s_5b72a8e7470db8::t_2ba1991abdbd43 58
+tests/integration/diff_segments_benchmarks.rs
+  s_5b72a8e7470db8::t_1af625a8bdd297 1-176
+tests/integration/main.rs
+  s_5b72a8e7470db8::t_9fdc90aed429bd 60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b7a8fde9031c49d6d8e83f9285af3c27a1427adb",
+  "prompts": {},
+  "sessions": {
+    "s_5b72a8e7470db8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "731d1c37-4230-4872-ab3c-69e0061b7907",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
