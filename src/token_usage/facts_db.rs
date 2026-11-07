@@ -7,7 +7,8 @@ use super::claude_facts::{CallFact, TranscriptFact, TurnFact};
 use super::db::{run_migrations, to_db_i64};
 use crate::error::GitAiError;
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
     CREATE TABLE IF NOT EXISTS schema_version (
         version INTEGER PRIMARY KEY
     );
@@ -61,7 +62,53 @@ const MIGRATIONS: &[&str] = &[r#"
     );
 
     INSERT INTO schema_version (version) VALUES (1);
-    "#];
+    "#,
+    r#"
+    CREATE TABLE span (
+        span_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        tool_use_id TEXT,
+        prompt_id TEXT,
+        request_id TEXT,
+        repo_key TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        author_kind TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        link_status TEXT NOT NULL DEFAULT 'pending',
+        link_attempts INTEGER NOT NULL DEFAULT 0,
+        next_link_at INTEGER,
+        pinned_commit TEXT,
+        pinned_blob TEXT,
+        pinned_at INTEGER
+    );
+    CREATE INDEX idx_span_tool_use ON span(session_id, tool_use_id);
+    CREATE INDEX idx_span_pending_link ON span(next_link_at) WHERE link_status = 'pending';
+    CREATE INDEX idx_span_repo_file ON span(repo_key, file_path);
+
+    CREATE TABLE span_piece (
+        span_id TEXT NOT NULL,
+        piece_index INTEGER NOT NULL,
+        start_byte INTEGER NOT NULL,
+        end_byte INTEGER NOT NULL,
+        PRIMARY KEY (span_id, piece_index)
+    );
+
+    CREATE TABLE survival_measurement (
+        span_id TEXT NOT NULL,
+        measured_at INTEGER NOT NULL,
+        committed_at INTEGER NOT NULL,
+        surviving_bytes INTEGER,
+        total_bytes INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        PRIMARY KEY (span_id, measured_at)
+    );
+
+    INSERT INTO schema_version (version) VALUES (2);
+    "#,
+];
 
 const CALL_UPSERT_SQL: &str = "
     INSERT INTO call (
@@ -293,10 +340,108 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 1);
+        assert_eq!(schema_version(&db), 2);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 1);
+        assert_eq!(schema_version(&db), 2);
+    }
+
+    fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
+        db.lock().execute(
+            "INSERT INTO span (
+                span_id, session_id, repo_key, file_path, author_kind, author_id,
+                source, content_hash, created_at
+             ) VALUES (?1, 's1', '/repo/.git', 'src/a.rs', 'ai', 'author-1',
+                       'file_edit', 'hash-1', 1000)",
+            params![span_id],
+        )
+    }
+
+    #[test]
+    fn a_v1_database_gains_the_span_tables_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute(
+                "INSERT INTO call (request_id, model) VALUES ('req-1', 'main-model')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 2);
+        assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
+        assert_eq!(row_count(&db, "span"), 0);
+        assert_eq!(row_count(&db, "span_piece"), 0);
+        assert_eq!(row_count(&db, "survival_measurement"), 0);
+    }
+
+    #[test]
+    fn a_new_span_starts_pending_with_no_attempts_and_nothing_pinned() {
+        let (_dir, db) = db();
+        insert_span(&db, "span-1").unwrap();
+
+        let stored: (String, i64, Option<i64>, Option<String>) = db
+            .lock()
+            .query_row(
+                "SELECT link_status, link_attempts, next_link_at, pinned_commit
+                 FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(stored, ("pending".to_string(), 0, None, None));
+    }
+
+    #[test]
+    fn span_ids_are_unique() {
+        let (_dir, db) = db();
+        insert_span(&db, "span-1").unwrap();
+
+        assert!(insert_span(&db, "span-1").is_err());
+        assert_eq!(row_count(&db, "span"), 1);
+    }
+
+    #[test]
+    fn a_span_has_one_row_per_piece_index() {
+        let (_dir, db) = db();
+        let insert_piece = |piece_index: i64| {
+            db.lock().execute(
+                "INSERT INTO span_piece (span_id, piece_index, start_byte, end_byte)
+                 VALUES ('span-1', ?1, 0, 10)",
+                params![piece_index],
+            )
+        };
+
+        insert_piece(0).unwrap();
+        insert_piece(1).unwrap();
+
+        assert!(insert_piece(1).is_err());
+        assert_eq!(row_count(&db, "span_piece"), 2);
+    }
+
+    #[test]
+    fn measurements_append_per_span_and_never_overwrite() {
+        let (_dir, db) = db();
+        let measure = |measured_at: i64| {
+            db.lock().execute(
+                "INSERT INTO survival_measurement
+                    (span_id, measured_at, committed_at, surviving_bytes, total_bytes, outcome)
+                 VALUES ('span-1', ?1, 500, 80, 100, 'ok')",
+                params![measured_at],
+            )
+        };
+
+        measure(1000).unwrap();
+        measure(2800).unwrap();
+
+        assert!(measure(2800).is_err());
+        assert_eq!(row_count(&db, "survival_measurement"), 2);
     }
 
     #[test]
