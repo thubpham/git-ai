@@ -1,0 +1,24 @@
+src/token_usage/claude_facts.rs
+  s_5b72a8e7470db8::t_cc18a03f3b020b 57,84,247
+tests/integration/token_usage.rs
+  s_5b72a8e7470db8::t_cc18a03f3b020b 702
+src/token_usage/facts_db.rs
+  s_5b72a8e7470db8::t_cc18a03f3b020b 212-213
+  s_5b72a8e7470db8::t_7db76d3ac91e58 214-215,349,376,380,403,414,455,491,545
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "459c9d3889b33f15647d4a55d8c3b19854408e23",
+  "prompts": {},
+  "sessions": {
+    "s_5b72a8e7470db8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "731d1c37-4230-4872-ab3c-69e0061b7907",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
