@@ -1588,7 +1588,11 @@ fn an_ai_edit_over_known_human_text_records_that_prior_and_the_human_span() {
     assert_eq!(human[0].prior_kind, "none");
     assert_eq!(human[0].edit_type, "add");
     assert_eq!(human[0].tool_use_id, None);
-    assert_eq!(human[0].pieces, vec![(13, 26)]);
+    assert_eq!(human[0].pieces, vec![(13, 19), (25, 30)]);
+    assert_eq!(
+        touch_rows(&repo),
+        vec![("ai".to_string(), "replace".to_string(), 2)]
+    );
 }
 
 #[test]
@@ -1609,4 +1613,90 @@ fn an_untracked_checkpoint_records_no_span() {
         .query_row("SELECT COUNT(*) FROM span", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+fn touch_rows(repo: &TestRepo) -> Vec<(String, String, i64)> {
+    let db = token_usage_db(repo);
+    let mut touches = db
+        .prepare("SELECT toucher_kind, touch_kind, bytes_removed FROM span_touch ORDER BY touch_id")
+        .unwrap();
+    touches
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(|touch| touch.unwrap())
+        .collect()
+}
+
+fn repo_with_one_ai_line() -> (TestRepo, std::path::PathBuf, std::path::PathBuf) {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst y = 2;\n",
+    );
+    (repo, transcript_path, file_path)
+}
+
+#[test]
+fn an_untracked_edit_above_a_span_shifts_it_without_a_touch() {
+    let (repo, _transcript_path, file_path) = repo_with_one_ai_line();
+
+    fs::write(&file_path, "// header\nconst x = 1;\nconst y = 2;\n").unwrap();
+    repo.git_ai(&["checkpoint", "human", "example.ts"]).unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    assert_eq!(span_rows(&repo, "ai")[0].pieces, vec![(23, 36)]);
+    assert_eq!(touch_rows(&repo), vec![]);
+}
+
+#[test]
+fn a_known_human_edit_inside_a_span_splits_it_and_records_the_touch() {
+    let (repo, _transcript_path, file_path) = repo_with_one_ai_line();
+
+    fs::write(&file_path, "const x = 1;\nconst y = 42;\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "example.ts"])
+        .unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    assert_eq!(span_rows(&repo, "ai")[0].pieces, vec![(13, 23), (25, 27)]);
+    assert_eq!(
+        touch_rows(&repo),
+        vec![("known_human".to_string(), "replace".to_string(), 1)]
+    );
+}
+
+#[test]
+fn an_ai_edit_that_deletes_a_span_leaves_it_with_no_pieces_and_records_a_delete() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai.len(), 1);
+    assert_eq!(ai[0].pieces, vec![]);
+    assert_eq!(
+        touch_rows(&repo),
+        vec![("ai".to_string(), "delete".to_string(), 13)]
+    );
 }

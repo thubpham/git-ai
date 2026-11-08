@@ -13,8 +13,8 @@ use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
 use crate::error::GitAiError;
 use crate::git::repo_storage::PersistedWorkingLog;
 use crate::git::repository::Repository;
-use crate::token_usage::facts_db::{FactsDatabase, NewSpan};
-use crate::token_usage::spans::span_draft;
+use crate::token_usage::facts_db::{FactsDatabase, NewSpan, SpanRemap, SpanTouch};
+use crate::token_usage::spans::{remap_pieces, span_draft};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -657,7 +657,7 @@ fn build_span_context(
     let author_kind = match kind {
         CheckpointKind::KnownHuman => "known_human",
         kind if kind.is_ai() => "ai",
-        _ => return None,
+        _ => "untracked",
     };
     let facts_db = crate::token_usage::facts_db::shared()?;
     let metadata = &checkpoint_request.metadata;
@@ -689,6 +689,17 @@ fn record_span(
     content: &str,
     ts: u128,
 ) {
+    let live_spans = match context.facts_db.live_spans(&context.repo_key, file_path) {
+        Ok(live_spans) => live_spans,
+        Err(error) => {
+            tracing::warn!(%error, file_path, "failed to fetch live spans for span recording");
+            return;
+        }
+    };
+    let records_span = context.author_kind != "untracked";
+    if live_spans.is_empty() && !records_span {
+        return;
+    }
     let segments = match AttributionTracker::new().compute_diff_segments(previous_content, content)
     {
         Ok(segments) => segments,
@@ -697,6 +708,32 @@ fn record_span(
             return;
         }
     };
+    let remaps: Vec<SpanRemap> = live_spans
+        .into_iter()
+        .filter_map(|span| {
+            let remap = remap_pieces(&span.pieces, &segments);
+            let touch = remap.touch.map(|touch_kind| SpanTouch {
+                touched_at: (ts / 1000) as i64,
+                toucher_kind: context.author_kind.to_string(),
+                toucher_id: context.author_id.clone(),
+                touch_kind,
+                bytes_removed: remap.bytes_removed,
+            });
+            (remap.pieces != span.pieces).then_some(SpanRemap {
+                span_id: span.span_id,
+                pieces: remap.pieces,
+                touch,
+            })
+        })
+        .collect();
+    if !remaps.is_empty()
+        && let Err(error) = context.facts_db.apply_remaps(&remaps)
+    {
+        tracing::warn!(%error, file_path, "failed to apply span remaps");
+    }
+    if !records_span {
+        return;
+    }
     let Some(draft) = span_draft(&segments, previous_attributions) else {
         return;
     };
