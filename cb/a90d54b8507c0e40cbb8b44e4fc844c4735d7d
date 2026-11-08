@@ -1,0 +1,19 @@
+src/daemon.rs
+  s_9d19adee41f8af::t_5c253fd2773240 7880-7882
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cba90d54b8507c0e40cbb8b44e4fc844c4735d7d",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
