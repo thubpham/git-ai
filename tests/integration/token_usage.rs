@@ -1,6 +1,7 @@
 //! End-to-end tests for TokenUsage metric events (event id 9): checkpoint ->
 //! stream worker -> token-usage worker -> metrics DB.
 
+use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::authorship_log_serialization::generate_session_id;
 use git_ai::metrics::db::MetricsDatabase;
@@ -1698,5 +1699,102 @@ fn an_ai_edit_that_deletes_a_span_leaves_it_with_no_pieces_and_records_a_delete(
     assert_eq!(
         touch_rows(&repo),
         vec![("ai".to_string(), "delete".to_string(), 13)]
+    );
+}
+
+fn pin_of_only_ai_span(repo: &TestRepo) -> (Option<String>, Option<String>, Option<i64>) {
+    token_usage_db(repo)
+        .query_row(
+            "SELECT pinned_commit, pinned_blob, pinned_at FROM span WHERE author_kind = 'ai'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn committing_a_file_pins_its_spans_to_the_commit_and_blob() {
+    let (repo, _transcript_path, _file_path) = repo_with_one_ai_line();
+
+    repo.stage_all_and_commit("add y").unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+    let head = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let blob = repo
+        .git(&["rev-parse", "HEAD:example.ts"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let (pinned_commit, pinned_blob, pinned_at) = pin_of_only_ai_span(&repo);
+    assert_eq!(pinned_commit, Some(head));
+    assert_eq!(pinned_blob, Some(blob));
+    assert!(pinned_at.is_some());
+}
+
+fn pinned_commits_by_tool_use(repo: &TestRepo) -> Vec<(String, Option<String>)> {
+    let db = token_usage_db(repo);
+    let mut spans = db
+        .prepare(
+            "SELECT tool_use_id, pinned_commit FROM span
+             WHERE author_kind = 'ai' ORDER BY created_at, span_id",
+        )
+        .unwrap();
+    spans
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|span| span.unwrap())
+        .collect()
+}
+
+#[test]
+fn a_span_in_a_file_left_out_of_a_commit_is_pinned_only_by_the_commit_that_includes_it() {
+    let (repo, transcript_path, _example_path) = repo_with_one_ai_line();
+    let other_path = repo.canonical_path().join("other.ts");
+    fs::write(&other_path, "const a = 1;\n").unwrap();
+    repo.git(&["add", "other.ts"]).unwrap();
+    repo.commit("add other").unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &other_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const a = 1;\nconst b = 2;\n",
+    );
+
+    repo.git(&["add", "example.ts"]).unwrap();
+    repo.commit("add y").unwrap();
+    sync_token_usage_pipeline(&repo);
+    let example_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    assert_eq!(
+        pinned_commits_by_tool_use(&repo),
+        vec![
+            ("toolu_edit_1".to_string(), Some(example_commit.clone())),
+            ("toolu_edit_2".to_string(), None),
+        ]
+    );
+
+    repo.stage_all_and_commit("add b").unwrap();
+    sync_token_usage_pipeline(&repo);
+    let other_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    let mut other = repo.filename("other.ts");
+    other.assert_committed_lines(lines![
+        "const a = 1;".unattributed_human(),
+        "const b = 2;".ai(),
+    ]);
+    assert_eq!(
+        pinned_commits_by_tool_use(&repo),
+        vec![
+            ("toolu_edit_1".to_string(), Some(example_commit)),
+            ("toolu_edit_2".to_string(), Some(other_commit)),
+        ]
     );
 }

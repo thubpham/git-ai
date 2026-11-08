@@ -758,6 +758,33 @@ fn record_span(
     }
 }
 
+pub fn pin_spans_for_commit(repo: &Repository, commit_sha: &str) {
+    let Some(facts_db) = crate::token_usage::facts_db::shared() else {
+        return;
+    };
+    let repo_key = repo.common_dir().to_string_lossy().into_owned();
+    let candidates = match facts_db.unpinned_files(&repo_key) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, commit_sha, "failed to list unpinned span files");
+            return;
+        }
+    };
+    let blobs = match repo.committed_blob_oids(commit_sha, &candidates) {
+        Ok(blobs) => blobs,
+        Err(error) => {
+            tracing::warn!(%error, commit_sha, "failed to read committed blobs for span pinning");
+            return;
+        }
+    };
+    let pinned_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    if let Err(error) = facts_db.pin_spans(&repo_key, commit_sha, pinned_at, &blobs) {
+        tracing::warn!(%error, commit_sha, "failed to pin spans");
+    }
+}
+
 fn build_previous_file_state_maps(
     previous_checkpoints: &[Checkpoint],
     initial_attributions: &HashMap<String, Vec<LineAttribution>>,
