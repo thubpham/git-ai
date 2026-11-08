@@ -5,6 +5,7 @@ use rusqlite::{Connection, Transaction, named_params, params};
 
 use super::claude_facts::{CallFact, TranscriptFact, TurnFact};
 use super::db::{run_migrations, to_db_i64};
+use super::spans::{EditType, PriorKind};
 use crate::error::GitAiError;
 
 const MIGRATIONS: &[&str] = &[
@@ -173,6 +174,23 @@ pub fn shared() -> Option<Arc<FactsDatabase>> {
     SHARED.get().cloned()
 }
 
+pub struct NewSpan {
+    pub span_id: String,
+    pub session_id: String,
+    pub tool_use_id: Option<String>,
+    pub prompt_id: Option<String>,
+    pub repo_key: String,
+    pub file_path: String,
+    pub author_kind: String,
+    pub author_id: String,
+    pub source: String,
+    pub content_hash: String,
+    pub created_at: i64,
+    pub prior_kind: PriorKind,
+    pub edit_type: EditType,
+    pub pieces: Vec<(usize, usize)>,
+}
+
 pub struct FactsDatabase {
     conn: Arc<Mutex<Connection>>,
 }
@@ -193,6 +211,42 @@ impl FactsDatabase {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn insert_span(&self, span: &NewSpan) -> Result<(), GitAiError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO span (
+                span_id, session_id, tool_use_id, prompt_id, repo_key, file_path,
+                author_kind, author_id, source, content_hash, created_at,
+                prior_kind, edit_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                span.span_id,
+                span.session_id,
+                span.tool_use_id,
+                span.prompt_id,
+                span.repo_key,
+                span.file_path,
+                span.author_kind,
+                span.author_id,
+                span.source,
+                span.content_hash,
+                span.created_at,
+                span.prior_kind.as_str(),
+                span.edit_type.as_str(),
+            ],
+        )?;
+        for (index, (start, end)) in span.pieces.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO span_piece (span_id, piece_index, start_byte, end_byte)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![span.span_id, index as i64, *start as i64, *end as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn commit_facts(&self, facts: &[TranscriptFact]) -> Result<(), GitAiError> {
@@ -397,6 +451,118 @@ mod tests {
                        'file_edit', 'hash-1', 1000)",
             params![span_id],
         )
+    }
+
+    fn new_span(span_id: &str) -> NewSpan {
+        NewSpan {
+            span_id: span_id.to_string(),
+            session_id: "s1".to_string(),
+            tool_use_id: Some("toolu_1".to_string()),
+            prompt_id: Some("p1".to_string()),
+            repo_key: "/repo/.git".to_string(),
+            file_path: "src/a.rs".to_string(),
+            author_kind: "ai".to_string(),
+            author_id: "author-1".to_string(),
+            source: "file_edit".to_string(),
+            content_hash: "hash-1".to_string(),
+            created_at: 1000,
+            prior_kind: PriorKind::KnownHuman,
+            edit_type: EditType::Replace,
+            pieces: vec![(0, 10), (40, 55)],
+        }
+    }
+
+    #[test]
+    fn inserting_a_span_writes_the_span_and_each_of_its_pieces() {
+        let (_dir, db) = db();
+
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        assert_eq!(row_count(&db, "span"), 1);
+        let pieces: Vec<(i64, i64)> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT start_byte, end_byte FROM span_piece
+                     WHERE span_id = 'span-1' ORDER BY piece_index",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|piece| piece.unwrap())
+                .collect()
+        };
+        assert_eq!(pieces, vec![(0, 10), (40, 55)]);
+    }
+
+    #[test]
+    fn an_inserted_span_keeps_its_join_key_and_edit_context() {
+        let (_dir, db) = db();
+
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        let stored: (String, String, String, String, String, String) = db
+            .lock()
+            .query_row(
+                "SELECT tool_use_id, prompt_id, author_kind, prior_kind, edit_type, link_status
+                 FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "toolu_1".to_string(),
+                "p1".to_string(),
+                "ai".to_string(),
+                "known_human".to_string(),
+                "replace".to_string(),
+                "pending".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn a_span_without_a_tool_use_id_still_saves() {
+        let (_dir, db) = db();
+        let mut span = new_span("span-1");
+        span.tool_use_id = None;
+        span.prompt_id = None;
+
+        db.insert_span(&span).unwrap();
+
+        let stored: (Option<String>, Option<String>) = db
+            .lock()
+            .query_row(
+                "SELECT tool_use_id, prompt_id FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None));
+    }
+
+    #[test]
+    fn a_duplicate_span_id_adds_no_rows() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        let mut again = new_span("span-1");
+        again.pieces = vec![(0, 1), (2, 3), (4, 5)];
+
+        assert!(db.insert_span(&again).is_err());
+
+        assert_eq!(row_count(&db, "span"), 1);
+        assert_eq!(row_count(&db, "span_piece"), 2);
     }
 
     #[test]

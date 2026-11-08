@@ -13,6 +13,8 @@ use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
 use crate::error::GitAiError;
 use crate::git::repo_storage::PersistedWorkingLog;
 use crate::git::repository::Repository;
+use crate::token_usage::facts_db::{FactsDatabase, NewSpan};
+use crate::token_usage::spans::span_draft;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -635,6 +637,90 @@ fn working_log_entry_has_non_human_attribution(entry: &WorkingLogEntry) -> bool 
             .any(|attr| is_ai_author_id(&attr.author_id))
 }
 
+struct SpanContext {
+    facts_db: Arc<FactsDatabase>,
+    session_id: String,
+    tool_use_id: Option<String>,
+    prompt_id: Option<String>,
+    repo_key: String,
+    author_kind: &'static str,
+    author_id: String,
+    source: String,
+}
+
+fn build_span_context(
+    kind: CheckpointKind,
+    author_id: &str,
+    repo: &Repository,
+    checkpoint_request: &CheckpointRequest,
+) -> Option<SpanContext> {
+    let author_kind = match kind {
+        CheckpointKind::KnownHuman => "known_human",
+        kind if kind.is_ai() => "ai",
+        _ => return None,
+    };
+    let facts_db = crate::token_usage::facts_db::shared()?;
+    let metadata = &checkpoint_request.metadata;
+    Some(SpanContext {
+        facts_db,
+        session_id: checkpoint_request
+            .agent_id
+            .as_ref()
+            .map(|agent| generate_session_id(&agent.id, &agent.tool))
+            .unwrap_or_default(),
+        tool_use_id: metadata.get("tool_use_id").cloned(),
+        prompt_id: metadata.get("prompt_id").cloned(),
+        repo_key: repo.common_dir().to_string_lossy().into_owned(),
+        author_kind,
+        author_id: author_id.to_string(),
+        source: metadata
+            .get("edit_kind")
+            .cloned()
+            .unwrap_or_else(|| "file_edit".to_string()),
+    })
+}
+
+fn record_span(
+    context: &SpanContext,
+    file_path: &str,
+    blob_sha: &str,
+    previous_content: &str,
+    previous_attributions: &[Attribution],
+    content: &str,
+    ts: u128,
+) {
+    let segments = match AttributionTracker::new().compute_diff_segments(previous_content, content)
+    {
+        Ok(segments) => segments,
+        Err(error) => {
+            tracing::warn!(%error, file_path, "failed to diff for span recording");
+            return;
+        }
+    };
+    let Some(draft) = span_draft(&segments, previous_attributions) else {
+        return;
+    };
+    let span = NewSpan {
+        span_id: crate::uuid::generate_v4(),
+        session_id: context.session_id.clone(),
+        tool_use_id: context.tool_use_id.clone(),
+        prompt_id: context.prompt_id.clone(),
+        repo_key: context.repo_key.clone(),
+        file_path: file_path.to_string(),
+        author_kind: context.author_kind.to_string(),
+        author_id: context.author_id.clone(),
+        source: context.source.clone(),
+        content_hash: blob_sha.to_string(),
+        created_at: (ts / 1000) as i64,
+        prior_kind: draft.prior_kind,
+        edit_type: draft.edit_type,
+        pieces: draft.pieces,
+    };
+    if let Err(error) = context.facts_db.insert_span(&span) {
+        tracing::warn!(%error, file_path, "failed to record span");
+    }
+}
+
 fn build_previous_file_state_maps(
     previous_checkpoints: &[Checkpoint],
     initial_attributions: &HashMap<String, Vec<LineAttribution>>,
@@ -677,6 +763,7 @@ fn get_checkpoint_entry_for_file(
     initial_snapshot_contents: Arc<HashMap<String, Arc<str>>>,
     parent_note_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     ts: u128,
+    span_context: Option<Arc<SpanContext>>,
 ) -> Result<Option<(WorkingLogEntry, FileLineStats)>, GitAiError> {
     // Deterministic blocking work for the TestRepo throughput guard; release builds omit it.
     #[cfg(feature = "test-support")]
@@ -880,6 +967,18 @@ fn get_checkpoint_entry_for_file(
         ts,
     })?;
 
+    if let Some(context) = span_context.as_deref() {
+        record_span(
+            context,
+            &file_path,
+            &file_content_hash,
+            &previous_content,
+            &prev_attributions,
+            &current_content,
+            ts,
+        );
+    }
+
     tracing::debug!(
         "[BENCHMARK] Processing file {} took {:?}",
         file_path,
@@ -951,6 +1050,8 @@ async fn get_checkpoint_entries(
         }
     };
 
+    let span_context = build_span_context(kind, &author_id, repo, checkpoint_request).map(Arc::new);
+
     // Get HEAD commit info for git operations
     let head_commit = match head_commit_override.map(str::trim) {
         Some("" | "initial") => None,
@@ -1002,6 +1103,7 @@ async fn get_checkpoint_entries(
         let initial_snapshot_contents = Arc::clone(&initial_snapshot_contents);
         let parent_note_attributions = Arc::clone(&parent_note_attributions);
         let semaphore = Arc::clone(&semaphore);
+        let span_context = span_context.clone();
 
         let task = async move {
             let _permit = semaphore
@@ -1024,6 +1126,7 @@ async fn get_checkpoint_entries(
                     initial_snapshot_contents.clone(),
                     parent_note_attributions.clone(),
                     ts,
+                    span_context,
                 )
             })
             .await

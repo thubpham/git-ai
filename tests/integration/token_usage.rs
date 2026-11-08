@@ -1396,3 +1396,217 @@ fn startup_token_usage_sweep_logs_discovered_transcripts() {
         "{logs}"
     );
 }
+
+fn claude_edit(
+    repo: &TestRepo,
+    session_id: &str,
+    transcript_path: &Path,
+    file_path: &Path,
+    tool_use_id: &str,
+    prompt_id: &str,
+    contents: &str,
+) {
+    for hook_event_name in ["PreToolUse", "PostToolUse"] {
+        let hook_input = json!({
+            "cwd": repo.canonical_path().to_string_lossy(),
+            "hook_event_name": hook_event_name,
+            "tool_name": "Write",
+            "tool_use_id": tool_use_id,
+            "prompt_id": prompt_id,
+            "session_id": session_id,
+            "transcript_path": transcript_path.to_string_lossy(),
+            "tool_input": { "file_path": file_path.to_string_lossy() }
+        })
+        .to_string();
+        repo.git_ai(&["checkpoint", "claude", "--hook-input", &hook_input])
+            .expect("checkpoint should succeed");
+        if hook_event_name == "PreToolUse" {
+            fs::write(file_path, contents).unwrap();
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct SpanRow {
+    file_path: String,
+    author_kind: String,
+    tool_use_id: Option<String>,
+    prompt_id: Option<String>,
+    source: String,
+    prior_kind: String,
+    edit_type: String,
+    pieces: Vec<(i64, i64)>,
+}
+
+fn span_rows(repo: &TestRepo, author_kind: &str) -> Vec<SpanRow> {
+    let db = token_usage_db(repo);
+    let mut spans = db
+        .prepare(
+            "SELECT span_id, file_path, author_kind, tool_use_id, prompt_id, source,
+                    prior_kind, edit_type
+             FROM span WHERE author_kind = ?1 ORDER BY created_at, span_id",
+        )
+        .unwrap();
+    let rows = spans
+        .query_map([author_kind], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SpanRow {
+                    file_path: row.get(1)?,
+                    author_kind: row.get(2)?,
+                    tool_use_id: row.get(3)?,
+                    prompt_id: row.get(4)?,
+                    source: row.get(5)?,
+                    prior_kind: row.get(6)?,
+                    edit_type: row.get(7)?,
+                    pieces: Vec::new(),
+                },
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    rows.into_iter()
+        .map(|(span_id, mut span)| {
+            let mut pieces = db
+                .prepare(
+                    "SELECT start_byte, end_byte FROM span_piece
+                     WHERE span_id = ?1 ORDER BY piece_index",
+                )
+                .unwrap();
+            span.pieces = pieces
+                .query_map([&span_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|piece| piece.unwrap())
+                .collect();
+            span
+        })
+        .collect()
+}
+
+#[test]
+fn an_ai_edit_that_appends_a_line_records_an_add_span_with_its_join_key() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst y = 2;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    assert_eq!(
+        span_rows(&repo, "ai"),
+        vec![SpanRow {
+            file_path: "example.ts".to_string(),
+            author_kind: "ai".to_string(),
+            tool_use_id: Some("toolu_edit_1".to_string()),
+            prompt_id: Some("prompt-1".to_string()),
+            source: "file_edit".to_string(),
+            prior_kind: "none".to_string(),
+            edit_type: "add".to_string(),
+            pieces: vec![(13, 26)],
+        }]
+    );
+}
+
+#[test]
+fn an_ai_edit_over_untracked_text_records_an_untracked_replace() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const total = 1;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let spans = span_rows(&repo, "ai");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].prior_kind, "untracked");
+    assert_eq!(spans[0].edit_type, "replace");
+    assert_eq!(spans[0].pieces, vec![(6, 12)]);
+}
+
+#[test]
+fn an_ai_edit_over_known_human_text_records_that_prior_and_the_human_span() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    fs::write(&file_path, "const x = 1;\nconst h = 3;\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "example.ts"])
+        .unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst hello = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai.len(), 1);
+    assert_eq!(ai[0].prior_kind, "known_human");
+    assert_eq!(ai[0].edit_type, "replace");
+    assert_eq!(ai[0].pieces, vec![(19, 25)]);
+    let human = span_rows(&repo, "known_human");
+    assert_eq!(human.len(), 1);
+    assert_eq!(human[0].prior_kind, "none");
+    assert_eq!(human[0].edit_type, "add");
+    assert_eq!(human[0].tool_use_id, None);
+    assert_eq!(human[0].pieces, vec![(13, 26)]);
+}
+
+#[test]
+fn an_untracked_checkpoint_records_no_span() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    fs::write(&file_path, "const x = 1;\nconst z = 9;\n").unwrap();
+    repo.git_ai(&["checkpoint", "human", "example.ts"]).unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    let count: i64 = token_usage_db(&repo)
+        .query_row("SELECT COUNT(*) FROM span", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}

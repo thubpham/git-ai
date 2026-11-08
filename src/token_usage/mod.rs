@@ -16,6 +16,7 @@ pub mod cost;
 pub mod db;
 pub mod extractor;
 pub mod facts_db;
+pub mod spans;
 pub mod types;
 
 pub use extractor::{UsageExtractor, extractor_for_tool};
