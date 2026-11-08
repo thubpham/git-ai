@@ -5,7 +5,7 @@ use rusqlite::{Connection, Transaction, named_params, params};
 
 use super::claude_facts::{CallFact, TranscriptFact, TurnFact};
 use super::db::{run_migrations, to_db_i64};
-use super::spans::{EditType, PriorKind};
+use super::spans::{EditType, PriorKind, TouchKind};
 use crate::error::GitAiError;
 
 const MIGRATIONS: &[&str] = &[
@@ -128,7 +128,27 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (3);
     "#,
+    r#"
+    ALTER TABLE span ADD COLUMN total_bytes INTEGER;
+
+    INSERT INTO schema_version (version) VALUES (4);
+    "#,
 ];
+
+fn insert_pieces(
+    tx: &Transaction,
+    span_id: &str,
+    pieces: &[(usize, usize)],
+) -> Result<(), GitAiError> {
+    for (index, (start, end)) in pieces.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO span_piece (span_id, piece_index, start_byte, end_byte)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![span_id, index as i64, *start as i64, *end as i64],
+        )?;
+    }
+    Ok(())
+}
 
 const CALL_UPSERT_SQL: &str = "
     INSERT INTO call (
@@ -191,6 +211,25 @@ pub struct NewSpan {
     pub pieces: Vec<(usize, usize)>,
 }
 
+pub struct LiveSpan {
+    pub span_id: String,
+    pub pieces: Vec<(usize, usize)>,
+}
+
+pub struct SpanTouch {
+    pub touched_at: i64,
+    pub toucher_kind: String,
+    pub toucher_id: String,
+    pub touch_kind: TouchKind,
+    pub bytes_removed: usize,
+}
+
+pub struct SpanRemap {
+    pub span_id: String,
+    pub pieces: Vec<(usize, usize)>,
+    pub touch: Option<SpanTouch>,
+}
+
 pub struct FactsDatabase {
     conn: Arc<Mutex<Connection>>,
 }
@@ -220,8 +259,8 @@ impl FactsDatabase {
             "INSERT INTO span (
                 span_id, session_id, tool_use_id, prompt_id, repo_key, file_path,
                 author_kind, author_id, source, content_hash, created_at,
-                prior_kind, edit_type
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                prior_kind, edit_type, total_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 span.span_id,
                 span.session_id,
@@ -236,14 +275,71 @@ impl FactsDatabase {
                 span.created_at,
                 span.prior_kind.as_str(),
                 span.edit_type.as_str(),
+                span.pieces
+                    .iter()
+                    .map(|(start, end)| end - start)
+                    .sum::<usize>() as i64,
             ],
         )?;
-        for (index, (start, end)) in span.pieces.iter().enumerate() {
+        insert_pieces(&tx, &span.span_id, &span.pieces)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn live_spans(&self, repo_key: &str, file_path: &str) -> Result<Vec<LiveSpan>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT piece.span_id, piece.start_byte, piece.end_byte
+             FROM span_piece piece JOIN span ON span.span_id = piece.span_id
+             WHERE span.repo_key = ?1 AND span.file_path = ?2
+             ORDER BY piece.span_id, piece.piece_index",
+        )?;
+        let rows = stmt.query_map(params![repo_key, file_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut spans: Vec<LiveSpan> = Vec::new();
+        for row in rows {
+            let (span_id, start, end) = row?;
+            let piece = (start as usize, end as usize);
+            match spans.last_mut() {
+                Some(last) if last.span_id == span_id => last.pieces.push(piece),
+                _ => spans.push(LiveSpan {
+                    span_id,
+                    pieces: vec![piece],
+                }),
+            }
+        }
+        Ok(spans)
+    }
+
+    pub fn apply_remaps(&self, remaps: &[SpanRemap]) -> Result<(), GitAiError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for remap in remaps {
             tx.execute(
-                "INSERT INTO span_piece (span_id, piece_index, start_byte, end_byte)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![span.span_id, index as i64, *start as i64, *end as i64],
+                "DELETE FROM span_piece WHERE span_id = ?1",
+                params![remap.span_id],
             )?;
+            insert_pieces(&tx, &remap.span_id, &remap.pieces)?;
+            if let Some(touch) = &remap.touch {
+                tx.execute(
+                    "INSERT INTO span_touch (
+                        span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        remap.span_id,
+                        touch.touched_at,
+                        touch.toucher_kind,
+                        touch.toucher_id,
+                        touch.touch_kind.as_str(),
+                        touch.bytes_removed as i64,
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -436,10 +532,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 3);
+        assert_eq!(schema_version(&db), 4);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 3);
+        assert_eq!(schema_version(&db), 4);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -581,7 +677,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 3);
+        assert_eq!(schema_version(&db), 4);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
@@ -612,7 +708,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 3);
+        assert_eq!(schema_version(&db), 4);
         let stored: (Option<String>, Option<String>) = db
             .lock()
             .query_row(
@@ -647,6 +743,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, ("known_human".to_string(), "replace".to_string()));
+    }
+
+    #[test]
+    fn an_inserted_span_remembers_its_original_size() {
+        let (_dir, db) = db();
+
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        let total: i64 = db
+            .lock()
+            .query_row(
+                "SELECT total_bytes FROM span WHERE span_id = 'span-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 25);
+    }
+
+    #[test]
+    fn live_spans_lists_the_pieces_of_one_file_in_order() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        let mut other_file = new_span("span-2");
+        other_file.file_path = "src/b.rs".to_string();
+        db.insert_span(&other_file).unwrap();
+
+        let live = db.live_spans("/repo/.git", "src/a.rs").unwrap();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].span_id, "span-1");
+        assert_eq!(live[0].pieces, vec![(0, 10), (40, 55)]);
+    }
+
+    #[test]
+    fn a_remap_replaces_the_pieces_and_appends_a_touch() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-1".to_string(),
+            pieces: vec![(5, 10)],
+            touch: Some(SpanTouch {
+                touched_at: 2000,
+                toucher_kind: "known_human".to_string(),
+                toucher_id: "human-1".to_string(),
+                touch_kind: TouchKind::Replace,
+                bytes_removed: 20,
+            }),
+        }])
+        .unwrap();
+
+        let live = db.live_spans("/repo/.git", "src/a.rs").unwrap();
+        assert_eq!(live[0].pieces, vec![(5, 10)]);
+        assert_eq!(row_count(&db, "span_touch"), 1);
+    }
+
+    #[test]
+    fn a_span_with_no_pieces_left_is_no_longer_live() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-1".to_string(),
+            pieces: Vec::new(),
+            touch: None,
+        }])
+        .unwrap();
+
+        assert!(db.live_spans("/repo/.git", "src/a.rs").unwrap().is_empty());
+        assert_eq!(row_count(&db, "span"), 1);
     }
 
     #[test]
