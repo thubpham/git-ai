@@ -37,6 +37,22 @@ impl EditType {
     }
 }
 
+// does not contain add because this describes later edit to an existing span only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchKind {
+    Replace,
+    Delete,
+}
+
+impl TouchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TouchKind::Replace => "replace",
+            TouchKind::Delete => "delete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanDraft {
     pub pieces: Vec<(usize, usize)>,
@@ -99,6 +115,46 @@ pub fn span_draft(segments: &[DiffSegment], old_attributions: &[Attribution]) ->
             EditType::Replace
         },
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remap {
+    pub pieces: Vec<(usize, usize)>,
+    pub bytes_removed: usize,
+    pub touch: Option<TouchKind>,
+}
+
+pub fn remap_pieces(pieces: &[(usize, usize)], segments: &[DiffSegment]) -> Remap {
+    let mut surviving = Vec::new();
+    let mut bytes_removed = 0;
+    let mut replaced_with_new_bytes = false;
+    for &(start, end) in pieces {
+        for segment in segments {
+            let (old_start, old_end) = segment.old_range;
+            let overlap_start = start.max(old_start);
+            let overlap_end = end.min(old_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            if segment.changed {
+                bytes_removed += overlap_end - overlap_start;
+                replaced_with_new_bytes |= segment.new_range.0 < segment.new_range.1;
+            } else {
+                let new_start = segment.new_range.0 + (overlap_start - old_start);
+                surviving.push((new_start, new_start + (overlap_end - overlap_start)));
+            }
+        }
+    }
+    let touch = match (bytes_removed, replaced_with_new_bytes) {
+        (0, _) => None,
+        (_, true) => Some(TouchKind::Replace),
+        (_, false) => Some(TouchKind::Delete),
+    };
+    Remap {
+        pieces: surviving,
+        bytes_removed,
+        touch,
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +274,67 @@ mod tests {
 
         assert_eq!(draft.pieces, vec![(6, 12)]);
         assert_eq!(draft.edit_type, EditType::Replace);
+    }
+
+    #[test]
+    fn pieces_after_an_insertion_shift_right_without_a_touch() {
+        let segments = [
+            segment((0, 0), (0, 5), true),
+            segment((0, 20), (5, 25), false),
+        ];
+        let remap = remap_pieces(&[(10, 15)], &segments);
+        assert_eq!(remap.pieces, vec![(15, 20)]);
+        assert_eq!(remap.bytes_removed, 0);
+        assert_eq!(remap.touch, None);
+    }
+
+    #[test]
+    fn an_insertion_inside_a_piece_splits_it_without_a_touch() {
+        let segments = [
+            segment((0, 10), (0, 10), false),
+            segment((10, 10), (10, 14), true),
+            segment((10, 20), (14, 24), false),
+        ];
+        let remap = remap_pieces(&[(5, 15)], &segments);
+        assert_eq!(remap.pieces, vec![(5, 10), (14, 19)]);
+        assert_eq!(remap.touch, None);
+    }
+
+    #[test]
+    fn overwriting_the_middle_of_a_piece_keeps_both_ends_and_records_a_replace() {
+        let segments = [
+            segment((0, 8), (0, 8), false),
+            segment((8, 12), (8, 9), true),
+            segment((12, 20), (9, 17), false),
+        ];
+        let remap = remap_pieces(&[(5, 15)], &segments);
+        assert_eq!(remap.pieces, vec![(5, 8), (9, 12)]);
+        assert_eq!(remap.bytes_removed, 4);
+        assert_eq!(remap.touch, Some(TouchKind::Replace));
+    }
+
+    #[test]
+    fn deleting_a_whole_piece_leaves_nothing_and_records_a_delete() {
+        let segments = [
+            segment((0, 5), (0, 5), false),
+            segment((5, 15), (5, 5), true),
+            segment((15, 20), (5, 10), false),
+        ];
+        let remap = remap_pieces(&[(5, 15)], &segments);
+        assert_eq!(remap.pieces, Vec::<(usize, usize)>::new());
+        assert_eq!(remap.bytes_removed, 10);
+        assert_eq!(remap.touch, Some(TouchKind::Delete));
+    }
+
+    #[test]
+    fn an_edit_elsewhere_leaves_a_piece_where_it_was() {
+        let segments = [
+            segment((0, 10), (0, 10), false),
+            segment((10, 14), (10, 12), true),
+            segment((14, 30), (12, 28), false),
+        ];
+        let remap = remap_pieces(&[(2, 6)], &segments);
+        assert_eq!(remap.pieces, vec![(2, 6)]);
+        assert_eq!(remap.touch, None);
     }
 }
