@@ -1,0 +1,40 @@
+src/token_usage/mod.rs
+  s_5b72a8e7470db8::t_f2edaa47399a23 19
+src/token_usage/spans.rs
+  s_5b72a8e7470db8::t_f2edaa47399a23 11,21-23,29,36-38,45,54-55,66,69-70,77-78,87,102,104-106,108-208,221-222
+  s_5b72a8e7470db8::t_046d0c5bfbb415 107,209-220
+  s_5b72a8e7470db8::t_c1c3b17ead06ab 1-10,12-20,24-28,30-35,39-44,46-53,56-65,67-68,71-76,79-86,88-101,103
+src/token_usage/facts_db.rs
+  s_5b72a8e7470db8::t_798f8df0d42d7b 177-193
+  s_5b72a8e7470db8::t_65f3b318d5399e 456-567
+  s_5b72a8e7470db8::t_f2dbc215a189fe 8
+  s_5b72a8e7470db8::t_b66665a57ad88d 216-251
+tests/integration/token_usage.rs
+  s_5b72a8e7470db8::t_4b3a004677e2a9 1399-1551,1553-1584,1586-1612
+  s_5b72a8e7470db8::t_f024316b3877fe 1552
+  s_5b72a8e7470db8::t_b5f464c759352c 1585
+src/daemon/checkpoint.rs
+  s_5b72a8e7470db8::t_ef5bd0e2dc0e7f 766
+  s_5b72a8e7470db8::t_2dd6266ece6083 1106
+  s_5b72a8e7470db8::t_f82bf314103e52 640-723
+  s_5b72a8e7470db8::t_5ce1263ef322e4 1129
+  s_5b72a8e7470db8::t_acb2a07a0bdd0b 16-17
+  s_5b72a8e7470db8::t_a89009119b2fcc 1053-1054
+  s_5b72a8e7470db8::t_dd863c7bf36cf0 970-981
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4d5fa55bed7b6720aad6041fa5e91898a160e9aa",
+  "prompts": {},
+  "sessions": {
+    "s_5b72a8e7470db8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "731d1c37-4230-4872-ab3c-69e0061b7907",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
