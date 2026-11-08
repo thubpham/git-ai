@@ -7877,6 +7877,9 @@ impl ActorDaemonCoordinator {
                                     Some(&recovery_preflight),
                                 )
                             })?;
+                            run_blocking_side_effect(|| {
+                                crate::daemon::checkpoint::pin_spans_for_commit(&repo, new_head)
+                            });
 
                             if !lite_mode
                                 && cmd.primary_command.as_deref() == Some("commit")
