@@ -1,0 +1,20 @@
+src/token_usage/spans.rs
+  s_9d19adee41f8af::t_2dcc29096ee117 43-55,120-159,278-284,293,297,305,309,318,322,331,335
+  s_9d19adee41f8af::t_6c6eb689dffab8 40-42,285-292,294-296,298-304,306-308,310-317,319-321,323-330,332-334,336-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ab1ad06cf6f996c3b13b742f03b0a4e6be4853fb",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
