@@ -1763,6 +1763,42 @@ impl Repository {
         Ok(files)
     }
 
+    pub fn committed_blob_oids(
+        &self,
+        commit_sha: &str,
+        pathspecs: &HashSet<String>,
+    ) -> Result<HashMap<String, String>, GitAiError> {
+        if pathspecs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut args = self.global_args_for_exec();
+        args.extend(
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--raw",
+                "--no-renames",
+                "-r",
+                "-z",
+            ]
+            .map(String::from),
+        );
+        if self.find_commit(commit_sha.to_string())?.parent_count()? == 0 {
+            args.push(crate::authorship::diff_base::EMPTY_TREE_SHA.to_string());
+        }
+        args.push(commit_sha.to_string());
+        let filter_in_process = pathspecs.len() > MAX_PATHSPEC_ARGS;
+        if !filter_in_process {
+            args.push("--".to_string());
+            args.extend(pathspecs.iter().cloned());
+        }
+        let mut blobs = parse_raw_diff_tree_blobs(&exec_git(&args)?.stdout);
+        if filter_in_process {
+            blobs.retain(|path, _| pathspecs.contains(path));
+        }
+        Ok(blobs)
+    }
+
     /// Get added line ranges from git diff between two commits
     /// Returns a HashMap of file paths to vectors of added line numbers
     ///
@@ -3321,9 +3357,58 @@ fn parse_hunk_header_counts(line: &str) -> Option<(u32, u32, u32)> {
     Some((start, count, old_count))
 }
 
+fn parse_raw_diff_tree_blobs(stdout: &[u8]) -> HashMap<String, String> {
+    let mut blobs = HashMap::new();
+    let mut fields = stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty());
+    while let Some(meta) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        let meta = String::from_utf8_lossy(meta);
+        let columns: Vec<&str> = meta.trim_start_matches(':').split_whitespace().collect();
+        let [_, _, _, new_oid, status] = columns[..] else {
+            continue;
+        };
+        if status.starts_with('D') {
+            continue;
+        }
+        if let Ok(path) = String::from_utf8(path.to_vec()) {
+            blobs.insert(path, new_oid.to_string());
+        }
+    }
+    blobs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+
+    #[test]
+    fn raw_diff_tree_output_maps_each_added_or_modified_path_to_its_new_blob() {
+        let stdout = format!(
+            ":000000 100644 {ZERO} aaaa A\0src/a.rs\0:100644 100644 bbbb cccc M\0src/b.rs\0"
+        );
+
+        let blobs = parse_raw_diff_tree_blobs(stdout.as_bytes());
+
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs["src/a.rs"], "aaaa");
+        assert_eq!(blobs["src/b.rs"], "cccc");
+    }
+
+    #[test]
+    fn raw_diff_tree_output_skips_deleted_paths() {
+        let stdout = format!(":100644 000000 dddd {ZERO} D\0src/gone.rs\0");
+
+        assert!(parse_raw_diff_tree_blobs(stdout.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn empty_raw_diff_tree_output_has_no_blobs() {
+        assert!(parse_raw_diff_tree_blobs(b"").is_empty());
+    }
 
     fn explicit_command_env(cmd: &Command, key: &str) -> Option<Option<String>> {
         cmd.get_envs()

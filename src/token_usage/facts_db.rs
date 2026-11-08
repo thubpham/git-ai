@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -314,6 +315,38 @@ impl FactsDatabase {
             }
         }
         Ok(spans)
+    }
+
+    pub fn unpinned_files(&self, repo_key: &str) -> Result<HashSet<String>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT file_path FROM span
+             WHERE repo_key = ?1 AND pinned_commit IS NULL",
+        )?;
+        let files = stmt
+            .query_map(params![repo_key], |row| row.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(files)
+    }
+
+    pub fn pin_spans(
+        &self,
+        repo_key: &str,
+        commit_sha: &str,
+        pinned_at: i64,
+        blobs: &HashMap<String, String>,
+    ) -> Result<(), GitAiError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (file_path, blob_sha) in blobs {
+            tx.execute(
+                "UPDATE span SET pinned_commit = ?1, pinned_blob = ?2, pinned_at = ?3
+                 WHERE repo_key = ?4 AND file_path = ?5 AND pinned_commit IS NULL",
+                params![commit_sha, blob_sha, pinned_at, repo_key, file_path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn apply_remaps(&self, remaps: &[SpanRemap]) -> Result<(), GitAiError> {
@@ -814,6 +847,88 @@ mod tests {
 
         assert!(db.live_spans("/repo/.git", "src/a.rs").unwrap().is_empty());
         assert_eq!(row_count(&db, "span"), 1);
+    }
+
+    fn pin_row(db: &FactsDatabase, span_id: &str) -> (Option<String>, Option<String>, Option<i64>) {
+        db.lock()
+            .query_row(
+                "SELECT pinned_commit, pinned_blob, pinned_at FROM span WHERE span_id = ?1",
+                params![span_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn blobs(file_path: &str, blob_sha: &str) -> HashMap<String, String> {
+        HashMap::from([(file_path.to_string(), blob_sha.to_string())])
+    }
+
+    #[test]
+    fn pinning_stamps_every_unpinned_span_of_a_committed_file() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.insert_span(&new_span("span-2")).unwrap();
+
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        let expected = (
+            Some("commit-1".to_string()),
+            Some("blob-1".to_string()),
+            Some(3000),
+        );
+        assert_eq!(pin_row(&db, "span-1"), expected);
+        assert_eq!(pin_row(&db, "span-2"), expected);
+    }
+
+    #[test]
+    fn pinning_leaves_spans_of_other_files_unpinned() {
+        let (_dir, db) = db();
+        let mut other_file = new_span("span-2");
+        other_file.file_path = "src/b.rs".to_string();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.insert_span(&other_file).unwrap();
+
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        assert_eq!(pin_row(&db, "span-2"), (None, None, None));
+    }
+
+    #[test]
+    fn a_pinned_span_is_never_pinned_again() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        db.pin_spans("/repo/.git", "commit-2", 4000, &blobs("src/a.rs", "blob-2"))
+            .unwrap();
+
+        assert_eq!(
+            pin_row(&db, "span-1"),
+            (
+                Some("commit-1".to_string()),
+                Some("blob-1".to_string()),
+                Some(3000)
+            )
+        );
+    }
+
+    #[test]
+    fn unpinned_files_lists_each_file_with_an_unpinned_span_once() {
+        let (_dir, db) = db();
+        let mut other_file = new_span("span-3");
+        other_file.file_path = "src/b.rs".to_string();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.insert_span(&new_span("span-2")).unwrap();
+        db.insert_span(&other_file).unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/b.rs", "blob-1"))
+            .unwrap();
+
+        let files = db.unpinned_files("/repo/.git").unwrap();
+
+        assert_eq!(files, HashSet::from(["src/a.rs".to_string()]));
     }
 
     #[test]
