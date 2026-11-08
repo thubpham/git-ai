@@ -1,0 +1,20 @@
+src/token_usage/facts_db.rs
+  s_9d19adee41f8af::t_0b8a8e386e4a1c 8,131-135,138-152,214-232,262-263,278-281,284-322,324-325,327-342,535,538,680,711,748-817
+  s_9d19adee41f8af::t_d9d8296eda88a1 818
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e7a62d7566257fae431ebe81b39df4c3906f8128",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
