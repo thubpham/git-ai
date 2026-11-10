@@ -1741,7 +1741,7 @@ fn pinned_commits_by_tool_use(repo: &TestRepo) -> Vec<(String, Option<String>)> 
     let mut spans = db
         .prepare(
             "SELECT tool_use_id, pinned_commit FROM span
-             WHERE author_kind = 'ai' ORDER BY created_at, span_id",
+             WHERE author_kind = 'ai' ORDER BY tool_use_id",
         )
         .unwrap();
     spans
@@ -1797,4 +1797,192 @@ fn a_span_in_a_file_left_out_of_a_commit_is_pinned_only_by_the_commit_that_inclu
             ("toolu_edit_2".to_string(), Some(other_commit)),
         ]
     );
+}
+
+#[test]
+fn an_ai_edit_over_ai_text_committed_earlier_records_ai_as_the_prior() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\nconst y = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai.len(), 2);
+    let second = ai
+        .iter()
+        .find(|span| span.tool_use_id.as_deref() == Some("toolu_edit_2"))
+        .unwrap();
+    assert_eq!(second.prior_kind, "ai");
+    assert_eq!(second.edit_type, "replace");
+}
+
+#[test]
+fn an_ai_edit_over_known_human_text_committed_earlier_records_known_human_as_the_prior() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    fs::write(&file_path, "const x = 1;\nconst h = 3;\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "example.ts"])
+        .unwrap();
+    repo.stage_all_and_commit("add h").unwrap();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst hello = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai.len(), 1);
+    assert_eq!(ai[0].prior_kind, "known_human");
+}
+
+#[derive(Debug, PartialEq)]
+struct LinkRow {
+    request_id: Option<String>,
+    link_status: String,
+    next_link_at: Option<i64>,
+    created_at: i64,
+}
+
+fn link_row(repo: &TestRepo, column: &str, value: &str) -> LinkRow {
+    token_usage_db(repo)
+        .query_row(
+            &format!(
+                "SELECT request_id, link_status, next_link_at, created_at
+                 FROM span WHERE {column} = ?1"
+            ),
+            [value],
+            |row| {
+                Ok(LinkRow {
+                    request_id: row.get(0)?,
+                    link_status: row.get(1)?,
+                    next_link_at: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_span_saved_before_its_call_is_linked_when_the_call_arrives() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    sync_token_usage_pipeline(&repo);
+
+    let waiting = link_row(&repo, "tool_use_id", "toolu_edit_1");
+    assert_eq!(waiting.request_id, None);
+    assert_eq!(waiting.link_status, "pending");
+    assert_eq!(waiting.next_link_at, Some(waiting.created_at + 1800));
+
+    let mut content = fs::read_to_string(&transcript_path).unwrap();
+    content.push_str(&claude_call_line(
+        "a-1",
+        "req-1",
+        &recent_ts(1, 0),
+        json!([{"type": "tool_use", "id": "toolu_edit_1"}]),
+        None,
+    ));
+    content.push('\n');
+    fs::write(&transcript_path, content).unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\nconst y = 2;\nconst z = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let linked = link_row(&repo, "tool_use_id", "toolu_edit_1");
+    assert_eq!(linked.request_id, Some("req-1".to_string()));
+    assert_eq!(linked.link_status, "linked");
+    assert_eq!(linked.next_link_at, None);
+    assert_eq!(
+        link_row(&repo, "tool_use_id", "toolu_edit_2").link_status,
+        "pending"
+    );
+}
+
+#[test]
+fn a_span_saved_after_its_call_is_linked_at_once() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    fs::write(
+        &transcript_path,
+        format!(
+            "{}\n",
+            claude_call_line(
+                "a-1",
+                "req-1",
+                &recent_ts(1, 0),
+                json!([{"type": "tool_use", "id": "toolu_edit_1"}]),
+                None,
+            )
+        ),
+    )
+    .unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst y = 2;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let linked = link_row(&repo, "tool_use_id", "toolu_edit_1");
+    assert_eq!(linked.request_id, Some("req-1".to_string()));
+    assert_eq!(linked.link_status, "linked");
+}
+
+#[test]
+fn a_known_human_span_has_no_call_to_link() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let file_path = repo.canonical_path().join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    fs::write(&file_path, "const x = 1;\nconst h = 3;\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "example.ts"])
+        .unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    let row = link_row(&repo, "author_kind", "known_human");
+    assert_eq!(row.request_id, None);
+    assert_eq!(row.link_status, "none");
+    assert_eq!(row.next_link_at, None);
 }

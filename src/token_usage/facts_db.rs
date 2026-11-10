@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use rusqlite::{Connection, Transaction, named_params, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 
 use super::claude_facts::{CallFact, TranscriptFact, TurnFact};
 use super::db::{run_migrations, to_db_i64};
@@ -151,6 +151,19 @@ fn insert_pieces(
     Ok(())
 }
 
+pub const LINK_DEADLINE_SECS: i64 = 30 * 60;
+
+const LINK_PENDING_SPANS_SQL: &str = "
+    UPDATE span
+    SET request_id = (
+            SELECT request_id FROM call_tool_use
+            WHERE call_tool_use.tool_use_id = span.tool_use_id
+        ),
+        link_status = 'linked',
+        next_link_at = NULL
+    WHERE link_status = 'pending'
+      AND tool_use_id IN (SELECT tool_use_id FROM call_tool_use)";
+
 const CALL_UPSERT_SQL: &str = "
     INSERT INTO call (
         request_id, message_id, uuid, parent_uuid, prompt_id, model, advisor_model, effort,
@@ -214,6 +227,7 @@ pub struct NewSpan {
 
 pub struct LiveSpan {
     pub span_id: String,
+    pub author_id: String,
     pub pieces: Vec<(usize, usize)>,
 }
 
@@ -256,12 +270,27 @@ impl FactsDatabase {
     pub fn insert_span(&self, span: &NewSpan) -> Result<(), GitAiError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let request_id: Option<String> = match &span.tool_use_id {
+            Some(tool_use_id) => tx
+                .query_row(
+                    "SELECT request_id FROM call_tool_use WHERE tool_use_id = ?1",
+                    params![tool_use_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let (link_status, next_link_at) = match (&span.tool_use_id, &request_id) {
+            (None, _) => ("none", None),
+            (Some(_), Some(_)) => ("linked", None),
+            (Some(_), None) => ("pending", Some(span.created_at + LINK_DEADLINE_SECS)),
+        };
         tx.execute(
             "INSERT INTO span (
                 span_id, session_id, tool_use_id, prompt_id, repo_key, file_path,
                 author_kind, author_id, source, content_hash, created_at,
-                prior_kind, edit_type, total_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                prior_kind, edit_type, total_bytes, request_id, link_status, next_link_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 span.span_id,
                 span.session_id,
@@ -280,6 +309,9 @@ impl FactsDatabase {
                     .iter()
                     .map(|(start, end)| end - start)
                     .sum::<usize>() as i64,
+                request_id,
+                link_status,
+                next_link_at,
             ],
         )?;
         insert_pieces(&tx, &span.span_id, &span.pieces)?;
@@ -290,7 +322,7 @@ impl FactsDatabase {
     pub fn live_spans(&self, repo_key: &str, file_path: &str) -> Result<Vec<LiveSpan>, GitAiError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT piece.span_id, piece.start_byte, piece.end_byte
+            "SELECT piece.span_id, span.author_id, piece.start_byte, piece.end_byte
              FROM span_piece piece JOIN span ON span.span_id = piece.span_id
              WHERE span.repo_key = ?1 AND span.file_path = ?2
              ORDER BY piece.span_id, piece.piece_index",
@@ -298,23 +330,35 @@ impl FactsDatabase {
         let rows = stmt.query_map(params![repo_key, file_path], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
         let mut spans: Vec<LiveSpan> = Vec::new();
         for row in rows {
-            let (span_id, start, end) = row?;
+            let (span_id, author_id, start, end) = row?;
             let piece = (start as usize, end as usize);
             match spans.last_mut() {
                 Some(last) if last.span_id == span_id => last.pieces.push(piece),
                 _ => spans.push(LiveSpan {
                     span_id,
+                    author_id,
                     pieces: vec![piece],
                 }),
             }
         }
         Ok(spans)
+    }
+
+    pub fn expire_unlinked_spans(&self, now: i64) -> Result<usize, GitAiError> {
+        let conn = self.lock();
+        let expired = conn.execute(
+            "UPDATE span SET link_status = 'unknown', next_link_at = NULL
+             WHERE link_status = 'pending' AND next_link_at <= ?1",
+            params![now],
+        )?;
+        Ok(expired)
     }
 
     pub fn unpinned_files(&self, repo_key: &str) -> Result<HashSet<String>, GitAiError> {
@@ -387,6 +431,7 @@ impl FactsDatabase {
                 TranscriptFact::Turn(turn) => upsert_turn(&tx, turn)?,
             }
         }
+        tx.execute(LINK_PENDING_SPANS_SQL, [])?;
         tx.commit()?;
         Ok(())
     }
@@ -807,6 +852,7 @@ mod tests {
 
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].span_id, "span-1");
+        assert_eq!(live[0].author_id, "author-1");
         assert_eq!(live[0].pieces, vec![(0, 10), (40, 55)]);
     }
 
@@ -929,6 +975,113 @@ mod tests {
         let files = db.unpinned_files("/repo/.git").unwrap();
 
         assert_eq!(files, HashSet::from(["src/a.rs".to_string()]));
+    }
+
+    fn call_with_tool_use(request_id: &str, tool_use_id: &str) -> TranscriptFact {
+        call_of(CallFact {
+            request_id: request_id.to_string(),
+            tool_use_ids: vec![tool_use_id.to_string()],
+            ..Default::default()
+        })
+    }
+
+    fn link_of(db: &FactsDatabase, span_id: &str) -> (Option<String>, String, Option<i64>) {
+        db.lock()
+            .query_row(
+                "SELECT request_id, link_status, next_link_at FROM span WHERE span_id = ?1",
+                params![span_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_span_saved_after_its_call_is_linked_at_insert() {
+        let (_dir, db) = db();
+        db.commit_facts(&[call_with_tool_use("req-1", "toolu_1")])
+            .unwrap();
+
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        assert_eq!(
+            link_of(&db, "span-1"),
+            (Some("req-1".to_string()), "linked".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn a_span_saved_before_its_call_waits_with_a_deadline() {
+        let (_dir, db) = db();
+
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        assert_eq!(
+            link_of(&db, "span-1"),
+            (None, "pending".to_string(), Some(1000 + LINK_DEADLINE_SECS))
+        );
+    }
+
+    #[test]
+    fn a_call_saved_after_its_span_links_it() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        db.commit_facts(&[call_with_tool_use("req-1", "toolu_1")])
+            .unwrap();
+
+        assert_eq!(
+            link_of(&db, "span-1"),
+            (Some("req-1".to_string()), "linked".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn a_call_for_another_tool_use_leaves_a_waiting_span_waiting() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        db.commit_facts(&[call_with_tool_use("req-2", "toolu_other")])
+            .unwrap();
+
+        assert_eq!(
+            link_of(&db, "span-1"),
+            (None, "pending".to_string(), Some(1000 + LINK_DEADLINE_SECS))
+        );
+    }
+
+    #[test]
+    fn a_span_without_a_tool_use_id_has_nothing_to_link() {
+        let (_dir, db) = db();
+        let mut span = new_span("span-1");
+        span.tool_use_id = None;
+
+        db.insert_span(&span).unwrap();
+
+        assert_eq!(link_of(&db, "span-1"), (None, "none".to_string(), None));
+    }
+
+    #[test]
+    fn expiring_marks_only_overdue_waiting_spans_unknown() {
+        let (_dir, db) = db();
+        let mut late = new_span("span-late");
+        late.created_at = 5000;
+        db.insert_span(&new_span("span-overdue")).unwrap();
+        db.insert_span(&late).unwrap();
+        db.commit_facts(&[call_with_tool_use("req-1", "toolu_linked")])
+            .unwrap();
+        let mut linked = new_span("span-linked");
+        linked.tool_use_id = Some("toolu_linked".to_string());
+        db.insert_span(&linked).unwrap();
+
+        let expired = db.expire_unlinked_spans(3000).unwrap();
+
+        assert_eq!(expired, 1);
+        assert_eq!(
+            link_of(&db, "span-overdue"),
+            (None, "unknown".to_string(), None)
+        );
+        assert_eq!(link_of(&db, "span-late").1, "pending");
+        assert_eq!(link_of(&db, "span-linked").1, "linked");
     }
 
     #[test]

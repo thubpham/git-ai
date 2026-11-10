@@ -708,6 +708,15 @@ fn record_span(
             return;
         }
     };
+    let prior_attributions: Vec<Attribution> = previous_attributions
+        .iter()
+        .cloned()
+        .chain(live_spans.iter().flat_map(|span| {
+            span.pieces
+                .iter()
+                .map(|&(start, end)| Attribution::new(start, end, span.author_id.clone(), 0))
+        }))
+        .collect();
     let remaps: Vec<SpanRemap> = live_spans
         .into_iter()
         .filter_map(|span| {
@@ -734,7 +743,7 @@ fn record_span(
     if !records_span {
         return;
     }
-    let Some(draft) = span_draft(&segments, previous_attributions) else {
+    let Some(draft) = span_draft(&segments, &prior_attributions) else {
         return;
     };
     let span = NewSpan {

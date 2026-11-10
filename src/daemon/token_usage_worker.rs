@@ -362,6 +362,7 @@ impl TokenUsageWorker {
         sweep_ticker.tick().await; // skip the immediate tick
 
         self.prune_old_entries().await;
+        self.expire_unlinked_spans().await;
         self.enqueue_sweep_tasks().await;
         self.reconcile_flagged().await;
 
@@ -392,6 +393,7 @@ impl TokenUsageWorker {
                 }
                 _ = sweep_ticker.tick() => {
                     self.prune_old_entries().await;
+                    self.expire_unlinked_spans().await;
                     self.enqueue_sweep_tasks().await;
                     // Crash recovery: reconcile flags left by a pass that
                     // died between its batch commit and its reconcile step,
@@ -487,6 +489,17 @@ impl TokenUsageWorker {
             }
         })
         .await;
+    }
+
+    async fn expire_unlinked_spans(&self) {
+        let token_db = self.token_db.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || match token_db.expire_unlinked_spans(now_secs()) {
+                Ok(0) => {}
+                Ok(expired) => tracing::info!(expired, "marked overdue spans as unknown"),
+                Err(e) => tracing::warn!(error = %e, "span link expiry failed"),
+            })
+            .await;
     }
 
     /// Enqueue supported transcripts the streams database knows about whose
@@ -3166,6 +3179,76 @@ mod tests {
             .unwrap();
         assert!(!tracked.pending_flush);
         assert!(sweep_candidates(&streams_db, &token_db).is_empty());
+    }
+
+    fn waiting_span(span_id: &str, created_at: i64) -> crate::token_usage::facts_db::NewSpan {
+        crate::token_usage::facts_db::NewSpan {
+            span_id: span_id.to_string(),
+            session_id: "s_link".to_string(),
+            tool_use_id: Some(format!("toolu_{span_id}")),
+            prompt_id: None,
+            repo_key: "/repo/.git".to_string(),
+            file_path: "src/a.rs".to_string(),
+            author_kind: "ai".to_string(),
+            author_id: "author-1".to_string(),
+            source: "file_edit".to_string(),
+            content_hash: "hash-1".to_string(),
+            created_at,
+            prior_kind: crate::token_usage::spans::PriorKind::None,
+            edit_type: crate::token_usage::spans::EditType::Add,
+            pieces: vec![(0, 5)],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_worker_marks_overdue_waiting_spans_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let facts_path = dir.path().join("transcript-facts-db");
+        let facts =
+            Arc::new(crate::token_usage::facts_db::FactsDatabase::open(&facts_path).unwrap());
+        let streams_db =
+            Arc::new(StreamsDatabase::open(dir.path().join("transcripts-db")).unwrap());
+        let token_db = Arc::new(
+            TokenUsageDatabase::open(dir.path().join("token-usage-db"))
+                .unwrap()
+                .with_facts_db(facts.clone()),
+        );
+        facts.insert_span(&waiting_span("overdue", 1000)).unwrap();
+        facts
+            .insert_span(&waiting_span("fresh", now_secs()))
+            .unwrap();
+        let (_notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_drain_tx, drain_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_collected, sink) = collecting_sink();
+        let worker = TokenUsageWorker {
+            streams_db,
+            token_db,
+            telemetry: DaemonTelemetryWorkerHandle::new_noop(),
+            shutdown_notify: Arc::new(Notify::new()),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            notify_rx,
+            drain_rx,
+            notify_queue: VecDeque::new(),
+            sweep_queue: VecDeque::new(),
+            queued: HashSet::new(),
+            sweep_interval: Duration::from_secs(600),
+            test_sink: Some(sink),
+            test_throttle: Some(Arc::new(|_| {})),
+        };
+
+        worker.expire_unlinked_spans().await;
+
+        let conn = rusqlite::Connection::open(&facts_path).unwrap();
+        let status = |span_id: &str| -> String {
+            conn.query_row(
+                "SELECT link_status FROM span WHERE span_id = ?1",
+                [span_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status("overdue"), "unknown");
+        assert_eq!(status("fresh"), "pending");
     }
 
     fn flag_off() -> AtomicBool {

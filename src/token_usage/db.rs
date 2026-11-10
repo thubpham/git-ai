@@ -573,6 +573,13 @@ impl TokenUsageDatabase {
         }
     }
 
+    pub fn expire_unlinked_spans(&self, now: i64) -> Result<usize, GitAiError> {
+        match &self.facts {
+            Some(facts_db) => facts_db.expire_unlinked_spans(now),
+            None => Ok(0),
+        }
+    }
+
     /// Best-effort removal of the database files (main + WAL/SHM). Used when
     /// the feature flag is off so no collected data is retained.
     pub fn remove_database_files(path: &Path) {
