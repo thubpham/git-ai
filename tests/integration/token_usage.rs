@@ -1986,3 +1986,49 @@ fn a_known_human_span_has_no_call_to_link() {
     assert_eq!(row.link_status, "none");
     assert_eq!(row.next_link_at, None);
 }
+
+fn open_facts_db(repo: &TestRepo) -> git_ai::token_usage::facts_db::FactsDatabase {
+    git_ai::token_usage::facts_db::FactsDatabase::open(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_pinned_span_that_a_later_edit_partly_overwrote_reports_its_surviving_bytes() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\nconst y = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let survival = open_facts_db(&repo).pinned_span_survival().unwrap();
+    assert_eq!(survival.len(), 1);
+    assert_eq!(survival[0].total_bytes, 13);
+    assert_eq!(survival[0].surviving_bytes, 12);
+}
+
+#[test]
+fn a_pinned_span_nobody_touched_survives_in_full() {
+    let (repo, _transcript_path, _file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+    sync_token_usage_pipeline(&repo);
+
+    let survival = open_facts_db(&repo).pinned_span_survival().unwrap();
+    assert_eq!(survival.len(), 1);
+    assert_eq!(survival[0].surviving_bytes, survival[0].total_bytes);
+}

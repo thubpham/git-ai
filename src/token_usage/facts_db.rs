@@ -245,6 +245,13 @@ pub struct SpanRemap {
     pub touch: Option<SpanTouch>,
 }
 
+pub struct SpanSurvival {
+    pub span_id: String,
+    pub committed_at: i64,
+    pub surviving_bytes: i64,
+    pub total_bytes: i64,
+}
+
 pub struct FactsDatabase {
     conn: Arc<Mutex<Connection>>,
 }
@@ -349,6 +356,31 @@ impl FactsDatabase {
             }
         }
         Ok(spans)
+    }
+
+    pub fn pinned_span_survival(&self) -> Result<Vec<SpanSurvival>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT span.span_id, span.pinned_at, span.total_bytes,
+                    COALESCE(SUM(piece.end_byte - piece.start_byte), 0)
+             FROM span LEFT JOIN span_piece piece ON piece.span_id = span.span_id
+             WHERE span.pinned_commit IS NOT NULL
+               AND span.pinned_at IS NOT NULL
+               AND span.total_bytes > 0
+             GROUP BY span.span_id
+             ORDER BY span.pinned_at, span.span_id",
+        )?;
+        let survival = stmt
+            .query_map([], |row| {
+                Ok(SpanSurvival {
+                    span_id: row.get(0)?,
+                    committed_at: row.get(1)?,
+                    total_bytes: row.get(2)?,
+                    surviving_bytes: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(survival)
     }
 
     pub fn expire_unlinked_spans(&self, now: i64) -> Result<usize, GitAiError> {
@@ -1082,6 +1114,82 @@ mod tests {
         );
         assert_eq!(link_of(&db, "span-late").1, "pending");
         assert_eq!(link_of(&db, "span-linked").1, "linked");
+    }
+
+    #[test]
+    fn a_pinned_span_nobody_touched_survives_in_full() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        let survival = db.pinned_span_survival().unwrap();
+
+        assert_eq!(survival.len(), 1);
+        assert_eq!(survival[0].span_id, "span-1");
+        assert_eq!(survival[0].committed_at, 3000);
+        assert_eq!(survival[0].surviving_bytes, 25);
+        assert_eq!(survival[0].total_bytes, 25);
+    }
+
+    #[test]
+    fn a_remapped_span_survives_only_in_its_remaining_pieces() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-1".to_string(),
+            pieces: vec![(24, 30)],
+            touch: None,
+        }])
+        .unwrap();
+
+        let survival = db.pinned_span_survival().unwrap();
+
+        assert_eq!(survival[0].surviving_bytes, 6);
+        assert_eq!(survival[0].total_bytes, 25);
+    }
+
+    #[test]
+    fn a_pinned_span_with_no_pieces_left_survives_as_zero() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-1".to_string(),
+            pieces: Vec::new(),
+            touch: None,
+        }])
+        .unwrap();
+
+        let survival = db.pinned_span_survival().unwrap();
+
+        assert_eq!(survival.len(), 1);
+        assert_eq!(survival[0].surviving_bytes, 0);
+        assert_eq!(survival[0].total_bytes, 25);
+    }
+
+    #[test]
+    fn spans_that_are_not_pinned_are_not_measured() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+
+        assert!(db.pinned_span_survival().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pinned_span_with_an_unknown_size_is_not_measured() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.lock()
+            .execute("UPDATE span SET total_bytes = NULL", [])
+            .unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        assert!(db.pinned_span_survival().unwrap().is_empty());
     }
 
     #[test]
