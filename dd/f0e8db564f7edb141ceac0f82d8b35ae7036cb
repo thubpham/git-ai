@@ -1,0 +1,23 @@
+src/daemon/checkpoint.rs
+  s_9d19adee41f8af::t_dfd61b1e6545e9 711-719,746
+src/token_usage/facts_db.rs
+  s_9d19adee41f8af::t_81399902d91496 217,294,302,304,309,315,813
+tests/integration/token_usage.rs
+  s_9d19adee41f8af::t_3178da4bf5d29a 1744,1801-1858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "ddf0e8db564f7edb141ceac0f82d8b35ae7036cb",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
