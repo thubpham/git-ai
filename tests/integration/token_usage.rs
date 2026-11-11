@@ -2033,8 +2033,7 @@ fn a_pinned_span_nobody_touched_survives_in_full() {
     assert_eq!(survival[0].surviving_bytes, survival[0].total_bytes);
 }
 
-#[test]
-fn the_survival_command_reports_a_span_that_has_reached_a_horizon() {
+fn repo_with_a_matured_ai_line() -> TestRepo {
     let (repo, _transcript_path, _file_path) = repo_with_one_ai_line();
     repo.stage_all_and_commit("add y").unwrap();
     sync_token_usage_pipeline(&repo);
@@ -2054,21 +2053,99 @@ fn the_survival_command_reports_a_span_that_has_reached_a_horizon() {
         [two_days],
     )
     .unwrap();
+    repo
+}
+
+fn measurement_count(repo: &TestRepo) -> i64 {
+    token_usage_db(repo)
+        .query_row("SELECT COUNT(*) FROM survival_measurement", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn survival_json(repo: &TestRepo, flags: &[&str]) -> serde_json::Value {
+    let mut args = vec!["survival", "--json"];
+    args.extend_from_slice(flags);
+    serde_json::from_str(&repo.git_ai(&args).unwrap()).unwrap()
+}
+
+#[test]
+fn the_survival_text_report_lists_the_matured_span_in_its_headline_table() {
+    let repo = repo_with_a_matured_ai_line();
 
     let report = repo.git_ai(&["survival"]).unwrap();
 
-    let day_lines: Vec<&str> = report.lines().filter(|line| line.contains("24h")).collect();
-    assert_eq!(day_lines.len(), 2, "{report}");
-    assert!(day_lines.iter().any(|line| line.contains("commit")));
-    assert!(day_lines.iter().any(|line| line.contains("generation")));
-    assert!(
-        day_lines.iter().all(|line| line.contains("100.0%")),
-        "{report}"
-    );
-    assert!(!report.contains("7d"), "{report}");
-    assert!(!report.contains("30d"), "{report}");
+    let start = report.find("01 HOW MUCH SURVIVES").expect(&report);
+    let end = report.find("02 SURVIVAL CURVE").expect(&report);
+    let headline = &report[start..end];
+    let rows: Vec<Vec<&str>> = headline
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| matches!(tokens.first(), Some(&"commit") | Some(&"generation")))
+        .collect();
+    assert_eq!(rows.len(), 2, "{headline}");
+    assert_eq!(rows[0], ["commit", "24h", "1", "13", "13", "100.0%"]);
+    assert_eq!(rows[1], ["generation", "24h", "1", "13", "13", "100.0%"]);
+    let mut file = repo.filename("example.ts");
     file.assert_committed_lines(lines![
         "const x = 1;".unattributed_human(),
         "const y = 2;".ai(),
     ]);
+}
+
+#[test]
+fn the_survival_json_carries_the_measured_age_and_the_totals() {
+    let repo = repo_with_a_matured_ai_line();
+
+    let report = survival_json(&repo, &[]);
+
+    assert_eq!(report["demo"], false);
+    assert_eq!(report["totals"]["bytes_written"], 13);
+    let horizons = report["horizons"].as_array().unwrap();
+    assert_eq!(horizons.len(), 2);
+    assert_eq!(horizons[0]["anchor"], "commit");
+    assert_eq!(horizons[0]["horizon"], "24h");
+    assert_eq!(horizons[0]["spans"], 1);
+    assert_eq!(horizons[0]["surviving_bytes"], 13);
+    assert_eq!(horizons[0]["total_bytes"], 13);
+    assert_eq!(horizons[1]["anchor"], "generation");
+    assert_eq!(report["cost"], serde_json::Value::Null);
+}
+
+#[test]
+fn survival_demo_shows_made_up_numbers_and_leaves_the_database_alone() {
+    let repo = repo_with_a_matured_ai_line();
+    assert_eq!(measurement_count(&repo), 0);
+
+    let report = survival_json(&repo, &["--demo"]);
+
+    assert_eq!(report["demo"], true);
+    assert_eq!(report["horizons"].as_array().unwrap().len(), 6);
+    assert_eq!(measurement_count(&repo), 0);
+}
+
+#[test]
+fn survival_without_measuring_reports_only_what_is_already_stored() {
+    let repo = repo_with_a_matured_ai_line();
+
+    let before = survival_json(&repo, &["--no-measure"]);
+
+    assert_eq!(before["horizons"].as_array().unwrap().len(), 0);
+    assert_eq!(measurement_count(&repo), 0);
+    let after = survival_json(&repo, &[]);
+    assert_eq!(after["horizons"].as_array().unwrap().len(), 2);
+    assert_eq!(measurement_count(&repo), 2);
+}
+
+#[test]
+fn survival_age_and_anchor_flags_choose_what_the_text_report_slices() {
+    let repo = repo_with_a_matured_ai_line();
+
+    let report = repo
+        .git_ai(&["survival", "--age", "24h", "--from", "generation"])
+        .unwrap();
+
+    assert!(report.contains("04 SLICES"), "{report}");
+    assert!(report.contains("generation"), "{report}");
 }

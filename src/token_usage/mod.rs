@@ -18,6 +18,8 @@ pub mod extractor;
 pub mod facts_db;
 pub mod spans;
 pub mod survival;
+pub mod survival_demo;
+pub mod survival_report;
 pub mod types;
 
 pub use extractor::{UsageExtractor, extractor_for_tool};

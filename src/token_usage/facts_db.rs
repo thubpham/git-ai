@@ -375,12 +375,22 @@ pub struct Loss {
     pub by_how: Vec<LossShare>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SliceDimension {
     Relationship,
     EditType,
     Tool,
     ModelEffort,
+}
+
+impl SliceDimension {
+    pub const ALL: [SliceDimension; 4] = [
+        SliceDimension::Relationship,
+        SliceDimension::EditType,
+        SliceDimension::Tool,
+        SliceDimension::ModelEffort,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

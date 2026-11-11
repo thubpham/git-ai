@@ -1,9 +1,14 @@
+use serde::{Deserialize, Serialize};
+
 const DAY_SECS: i64 = 24 * 60 * 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Horizon {
+    #[serde(rename = "24h")]
     Day,
+    #[serde(rename = "7d")]
     Week,
+    #[serde(rename = "30d")]
     Month,
 }
 
@@ -27,7 +32,8 @@ impl Horizon {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SurvivalAnchor {
     Commit,
     Generation,

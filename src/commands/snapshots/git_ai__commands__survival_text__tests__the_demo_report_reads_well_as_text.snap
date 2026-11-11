@@ -1,0 +1,98 @@
+---
+source: src/commands/survival_text.rs
+expression: "render_text(&demo, View::default_for(&demo), false)"
+---
+SPAN SURVIVAL ANALYSIS
+DEMO DATA: these numbers are made up and do not come from your repositories.
+How much of the code AI writes is still there later, and why the rest disappears.
+A span is a stretch of bytes an AI wrote.
+
+01 HOW MUCH SURVIVES
+Of the bytes AI wrote, the share still in the code after 24 hours, 7 days and 30 days. Each age counts only code that old.
+
+  AI bytes written   2.4 MB   (1,284 spans)
+  Still there now    61%   (all ages)
+
+  from        age    spans  surviving    written  retention
+  commit      24h    1,284  2,063,597  2,516,582      82.0%
+  commit      7d       902  1,159,000  1,900,000      61.0%
+  commit      30d      417    396,000    900,000      44.0%
+  generation  24h    1,310  1,879,600  2,540,000      74.0%
+  generation  7d       930    975,000  1,950,000      50.0%
+  generation  30d      430    285,200    920,000      31.0%
+
+02 SURVIVAL CURVE
+How the share of AI bytes still present changes as code ages. 'from commit' starts the clock at commit; 'from generation' starts it when the code was written, and includes code never committed.
+
+  from commit
+    0     ████████████████████ 100%
+    24h   ████████████████░░░░  82%
+    7d    ████████████░░░░░░░░  61%
+    30d   █████████░░░░░░░░░░░  44%
+  from generation
+    0     ████████████████████ 100%
+    24h   ███████████████░░░░░  74%
+    7d    ██████████░░░░░░░░░░  50%
+    30d   ██████░░░░░░░░░░░░░░  31%
+
+03 WHY IT DIES
+Of the bytes that disappeared, who removed them and how. Human edits only show up when the editor extension is running.
+
+  who removed it
+    AI           █████████░░░░░░░░░░░  46%   449.2 KB
+    known human  ████████░░░░░░░░░░░░  38%   371.1 KB
+    untracked    ███░░░░░░░░░░░░░░░░░  16%   156.2 KB
+  how it was removed
+    replaced     ██████████████░░░░░░  71%   693.4 KB
+    deleted      ██████░░░░░░░░░░░░░░  29%   283.2 KB
+
+04 SLICES
+Retention at the chosen age, split by how the code was written. Bars are weighted by bytes, so big edits count more. Groups under 10 spans are marked too few.
+Showing from commit at 30d.
+
+  what it replaced
+    human code         ██████████░░░░░░░░░░  52%   n=212
+    AI code            ████████░░░░░░░░░░░░  38%   n=148
+    fresh addition     ██████████████░░░░░░  71%   n=57
+  edit type
+    added              █████████████░░░░░░░  66%   n=301
+    replaced           ███████░░░░░░░░░░░░░  35%   n=116
+  tool
+    file edit          █████████████░░░░░░░  63%   n=350
+    bash               ████░░░░░░░░░░░░░░░░  22%   n=67
+  model · effort
+    model-a · high     ████████████░░░░░░░░  58%   n=96
+    model-a · low      ████████░░░░░░░░░░░░  41%   n=88
+    model-b · high     ██████████░░░░░░░░░░  49%   n=44
+
+05 BEST AND WORST FILES
+Files whose AI code lasted longest and shortest at the chosen age. Files under 1 KB of AI code are left out.
+
+  best   src/token_usage/facts_db.rs                18.2 KB   96%
+  best   src/commands/survival.rs                    9.1 KB   91%
+  best   tests/integration/token_usage.rs            4.4 KB   88%
+  worst  src/commands/mod.rs                         2.0 KB    4%
+  worst  scripts/migrate.sh                          1.3 KB    7%
+  worst  src/commands/git_ai_handlers.rs             6.8 KB   12%
+
+06 COST PER SURVIVING KB
+Dollars spent on a model's calls for each kilobyte of its code that survived.
+
+  model-a      ████████████████████ $0.042
+  model-b      ███████████████░░░░░ $0.031
+  model-c      █████████░░░░░░░░░░░ $0.018
+
+07 WHAT THIS RESTS ON
+How many spans each number comes from, and what the data can't see.
+
+  captured 1,284
+  committed 1,102
+  model known 874
+  model unknown 63
+  waiting for a call 18
+  no tool call 329
+  reached 24h 1,284
+  reached 7d 902
+  reached 30d 417
+
+Retention can read too high: a file deleted outside the editor, or edited where no checkpoint fired, still counts as surviving. 'Model unknown' means no matching Claude call was found (a non-Claude agent, or no transcript).
