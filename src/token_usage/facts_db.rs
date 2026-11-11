@@ -164,6 +164,58 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+fn loss_by(conn: &Connection, column: &str) -> Result<Vec<LossShare>, GitAiError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {column}, SUM(bytes_removed) AS removed FROM span_touch
+         GROUP BY {column} ORDER BY removed DESC, {column}"
+    ))?;
+    let shares = stmt
+        .query_map([], |row| {
+            Ok(LossShare {
+                kind: row.get(0)?,
+                bytes: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(shares)
+}
+
+fn ranked_files(
+    conn: &Connection,
+    anchor: SurvivalAnchor,
+    horizon: Horizon,
+    min_bytes: i64,
+    limit: usize,
+    order: &str,
+) -> Result<Vec<FileSurvival>, GitAiError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT span.repo_key, span.file_path, SUM(m.surviving_bytes), SUM(m.total_bytes)
+         FROM survival_measurement m
+         JOIN span ON span.span_id = m.span_id
+         WHERE m.anchor = ?1 AND m.horizon = ?2
+           AND m.outcome = 'ok' AND m.surviving_bytes IS NOT NULL
+         GROUP BY span.repo_key, span.file_path
+         HAVING SUM(m.total_bytes) >= ?3
+         ORDER BY CAST(SUM(m.surviving_bytes) AS REAL) / SUM(m.total_bytes) {order},
+                  span.repo_key, span.file_path
+         LIMIT ?4"
+    ))?;
+    let files = stmt
+        .query_map(
+            params![anchor.as_str(), horizon.as_str(), min_bytes, limit as i64],
+            |row| {
+                Ok(FileSurvival {
+                    repo_key: row.get(0)?,
+                    file_path: row.get(1)?,
+                    surviving_bytes: row.get(2)?,
+                    total_bytes: row.get(3)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(files)
+}
+
 fn insert_pieces(
     tx: &Transaction,
     span_id: &str,
@@ -302,6 +354,67 @@ fn anchor_column(anchor: SurvivalAnchor) -> &'static str {
         SurvivalAnchor::Commit => "span.pinned_at",
         SurvivalAnchor::Generation => "span.created_at",
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanTotals {
+    pub spans: i64,
+    pub bytes_written: i64,
+    pub bytes_alive: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LossShare {
+    pub kind: String,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loss {
+    pub by_who: Vec<LossShare>,
+    pub by_how: Vec<LossShare>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceDimension {
+    Relationship,
+    EditType,
+    Tool,
+    ModelEffort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceRow {
+    pub anchor: SurvivalAnchor,
+    pub horizon: Horizon,
+    pub label: String,
+    pub spans: i64,
+    pub surviving_bytes: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSurvival {
+    pub repo_key: String,
+    pub file_path: String,
+    pub surviving_bytes: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileExamples {
+    pub best: Vec<FileSurvival>,
+    pub worst: Vec<FileSurvival>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanQuality {
+    pub spans: i64,
+    pub pinned: i64,
+    pub linked: i64,
+    pub pending: i64,
+    pub unknown: i64,
+    pub none: i64,
 }
 
 pub struct FactsDatabase {
@@ -504,6 +617,113 @@ impl FactsDatabase {
             }
         }
         Ok(report)
+    }
+
+    pub fn span_totals(&self) -> Result<SpanTotals, GitAiError> {
+        let conn = self.lock();
+        let (spans, bytes_written, bytes_alive) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(span.total_bytes), 0),
+                    COALESCE(SUM((SELECT COALESCE(SUM(piece.end_byte - piece.start_byte), 0)
+                                  FROM span_piece piece
+                                  WHERE piece.span_id = span.span_id)), 0)
+             FROM span WHERE span.total_bytes > 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(SpanTotals {
+            spans,
+            bytes_written,
+            bytes_alive,
+        })
+    }
+
+    pub fn loss(&self) -> Result<Loss, GitAiError> {
+        let conn = self.lock();
+        Ok(Loss {
+            by_who: loss_by(&conn, "toucher_kind")?,
+            by_how: loss_by(&conn, "touch_kind")?,
+        })
+    }
+
+    pub fn slice(&self, dimension: SliceDimension) -> Result<Vec<SliceRow>, GitAiError> {
+        let (label, join) = match dimension {
+            SliceDimension::Relationship => ("COALESCE(span.prior_kind, 'unknown')", ""),
+            SliceDimension::EditType => ("COALESCE(span.edit_type, 'unknown')", ""),
+            SliceDimension::Tool => ("span.source", ""),
+            SliceDimension::ModelEffort => (
+                "COALESCE(call.model, 'unknown') || ' · ' || COALESCE(call.effort, 'unset')",
+                "JOIN call ON call.request_id = span.request_id",
+            ),
+        };
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {label}, COUNT(*), SUM(m.surviving_bytes), SUM(m.total_bytes)
+             FROM survival_measurement m
+             JOIN span ON span.span_id = m.span_id
+             {join}
+             WHERE m.anchor = ?1 AND m.horizon = ?2
+               AND m.outcome = 'ok' AND m.surviving_bytes IS NOT NULL
+             GROUP BY 1 ORDER BY 1"
+        ))?;
+        let mut rows = Vec::new();
+        for anchor in SurvivalAnchor::ALL {
+            for horizon in Horizon::ALL {
+                let found = stmt
+                    .query_map(params![anchor.as_str(), horizon.as_str()], |row| {
+                        Ok(SliceRow {
+                            anchor,
+                            horizon,
+                            label: row.get(0)?,
+                            spans: row.get(1)?,
+                            surviving_bytes: row.get(2)?,
+                            total_bytes: row.get(3)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows.extend(found);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn file_examples(
+        &self,
+        anchor: SurvivalAnchor,
+        horizon: Horizon,
+        min_bytes: i64,
+        limit: usize,
+    ) -> Result<FileExamples, GitAiError> {
+        let conn = self.lock();
+        Ok(FileExamples {
+            best: ranked_files(&conn, anchor, horizon, min_bytes, limit, "DESC")?,
+            worst: ranked_files(&conn, anchor, horizon, min_bytes, limit, "ASC")?,
+        })
+    }
+
+    pub fn span_quality(&self) -> Result<SpanQuality, GitAiError> {
+        let conn = self.lock();
+        let quality = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(pinned_commit IS NOT NULL), 0),
+                    COALESCE(SUM(link_status = 'linked'), 0),
+                    COALESCE(SUM(link_status = 'pending'), 0),
+                    COALESCE(SUM(link_status = 'unknown'), 0),
+                    COALESCE(SUM(link_status = 'none'), 0)
+             FROM span WHERE total_bytes > 0",
+            [],
+            |row| {
+                Ok(SpanQuality {
+                    spans: row.get(0)?,
+                    pinned: row.get(1)?,
+                    linked: row.get(2)?,
+                    pending: row.get(3)?,
+                    unknown: row.get(4)?,
+                    none: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(quality)
     }
 
     pub fn expire_unlinked_spans(&self, now: i64) -> Result<usize, GitAiError> {
@@ -2038,5 +2258,550 @@ mod tests {
                 (SurvivalAnchor::Generation, Horizon::Day),
             ]
         );
+    }
+
+    const NOW: i64 = 3000 + 2 * DAY;
+
+    fn span_of(
+        span_id: &str,
+        file_path: &str,
+        prior_kind: PriorKind,
+        edit_type: EditType,
+        source: &str,
+    ) -> NewSpan {
+        NewSpan {
+            file_path: file_path.to_string(),
+            prior_kind,
+            edit_type,
+            source: source.to_string(),
+            ..new_span(span_id)
+        }
+    }
+
+    fn pin_new_span(db: &FactsDatabase, span: NewSpan) {
+        let repo_key = span.repo_key.clone();
+        let file_path = span.file_path.clone();
+        db.insert_span(&span).unwrap();
+        db.pin_spans(&repo_key, "commit-1", 3000, &blobs(&file_path, "blob-1"))
+            .unwrap();
+    }
+
+    fn file_span(repo_key: &str, span_id: &str, file_path: &str, length: usize) -> NewSpan {
+        NewSpan {
+            repo_key: repo_key.to_string(),
+            file_path: file_path.to_string(),
+            pieces: vec![(0, length)],
+            ..new_span(span_id)
+        }
+    }
+
+    fn add_touch_by(
+        db: &FactsDatabase,
+        span_id: &str,
+        toucher_kind: &str,
+        touch_kind: &str,
+        bytes_removed: i64,
+    ) {
+        db.lock()
+            .execute(
+                "INSERT INTO span_touch (
+                    span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
+                 ) VALUES (?1, 3100, ?2, 'toucher-1', ?3, ?4)",
+                params![span_id, toucher_kind, touch_kind, bytes_removed],
+            )
+            .unwrap();
+    }
+
+    fn slice_row(
+        anchor: SurvivalAnchor,
+        horizon: Horizon,
+        label: &str,
+        spans: i64,
+        surviving_bytes: i64,
+        total_bytes: i64,
+    ) -> SliceRow {
+        SliceRow {
+            anchor,
+            horizon,
+            label: label.to_string(),
+            spans,
+            surviving_bytes,
+            total_bytes,
+        }
+    }
+
+    fn share(kind: &str, bytes: i64) -> LossShare {
+        LossShare {
+            kind: kind.to_string(),
+            bytes,
+        }
+    }
+
+    fn call_with_model(
+        request_id: &str,
+        tool_use_id: &str,
+        effort: Option<&str>,
+    ) -> TranscriptFact {
+        call_of(CallFact {
+            request_id: request_id.to_string(),
+            model: Some("claude-x".to_string()),
+            effort: effort.map(str::to_string),
+            tool_use_ids: vec![tool_use_id.to_string()],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn totals_count_every_span_and_the_bytes_still_alive() {
+        let (_dir, db) = db();
+        pin_new_span(&db, new_span("span-a"));
+        db.insert_span(&file_span("/repo/.git", "span-b", "src/b.rs", 10))
+            .unwrap();
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-a".to_string(),
+            pieces: vec![(0, 10)],
+            touch: Some(SpanTouch {
+                touched_at: 3100,
+                toucher_kind: "ai".to_string(),
+                toucher_id: "author-2".to_string(),
+                touch_kind: TouchKind::Replace,
+                bytes_removed: 15,
+            }),
+        }])
+        .unwrap();
+
+        let totals = db.span_totals().unwrap();
+
+        assert_eq!(
+            totals,
+            SpanTotals {
+                spans: 2,
+                bytes_written: 35,
+                bytes_alive: 20
+            }
+        );
+    }
+
+    #[test]
+    fn totals_skip_spans_with_no_recorded_size() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-a")).unwrap();
+        db.insert_span(&file_span("/repo/.git", "span-b", "src/b.rs", 10))
+            .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE span SET total_bytes = NULL WHERE span_id = 'span-b'",
+                [],
+            )
+            .unwrap();
+
+        let totals = db.span_totals().unwrap();
+
+        assert_eq!(
+            totals,
+            SpanTotals {
+                spans: 1,
+                bytes_written: 25,
+                bytes_alive: 25
+            }
+        );
+    }
+
+    #[test]
+    fn loss_is_summed_by_who_and_by_how() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-a")).unwrap();
+        add_touch_by(&db, "span-a", "ai", "replace", 10);
+        add_touch_by(&db, "span-a", "known_human", "delete", 5);
+        add_touch_by(&db, "span-a", "ai", "delete", 3);
+
+        let loss = db.loss().unwrap();
+
+        assert_eq!(loss.by_who, vec![share("ai", 13), share("known_human", 5)]);
+        assert_eq!(loss.by_how, vec![share("replace", 10), share("delete", 8)]);
+    }
+
+    #[test]
+    fn loss_is_empty_when_nothing_was_removed() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-a")).unwrap();
+
+        let loss = db.loss().unwrap();
+
+        assert_eq!(loss.by_who, Vec::<LossShare>::new());
+        assert_eq!(loss.by_how, Vec::<LossShare>::new());
+    }
+
+    #[test]
+    fn a_relationship_slice_pools_measurements_by_prior_kind() {
+        let (_dir, db) = db();
+        pin_new_span(
+            &db,
+            span_of(
+                "s1",
+                "src/a.rs",
+                PriorKind::KnownHuman,
+                EditType::Replace,
+                "file_edit",
+            ),
+        );
+        pin_new_span(
+            &db,
+            span_of(
+                "s2",
+                "src/b.rs",
+                PriorKind::Ai,
+                EditType::Replace,
+                "file_edit",
+            ),
+        );
+        pin_new_span(
+            &db,
+            span_of(
+                "s3",
+                "src/c.rs",
+                PriorKind::KnownHuman,
+                EditType::Replace,
+                "file_edit",
+            ),
+        );
+        add_touch(&db, "s1", 3100, 5);
+        db.measure_due_spans(NOW).unwrap();
+
+        let rows = db.slice(SliceDimension::Relationship).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                slice_row(SurvivalAnchor::Commit, Horizon::Day, "ai", 1, 25, 25),
+                slice_row(
+                    SurvivalAnchor::Commit,
+                    Horizon::Day,
+                    "known_human",
+                    2,
+                    45,
+                    50
+                ),
+                slice_row(SurvivalAnchor::Generation, Horizon::Day, "ai", 1, 25, 25),
+                slice_row(
+                    SurvivalAnchor::Generation,
+                    Horizon::Day,
+                    "known_human",
+                    2,
+                    45,
+                    50
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_type_slice_pools_measurements_by_edit_type() {
+        let (_dir, db) = db();
+        pin_new_span(
+            &db,
+            span_of(
+                "s1",
+                "src/a.rs",
+                PriorKind::None,
+                EditType::Add,
+                "file_edit",
+            ),
+        );
+        pin_new_span(
+            &db,
+            span_of(
+                "s2",
+                "src/b.rs",
+                PriorKind::Ai,
+                EditType::Replace,
+                "file_edit",
+            ),
+        );
+        db.measure_due_spans(NOW).unwrap();
+
+        let rows = db.slice(SliceDimension::EditType).unwrap();
+
+        let commit: Vec<(String, i64)> = rows
+            .iter()
+            .filter(|row| row.anchor == SurvivalAnchor::Commit)
+            .map(|row| (row.label.clone(), row.spans))
+            .collect();
+        assert_eq!(
+            commit,
+            vec![("add".to_string(), 1), ("replace".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_tool_slice_pools_measurements_by_source() {
+        let (_dir, db) = db();
+        pin_new_span(
+            &db,
+            span_of(
+                "s1",
+                "src/a.rs",
+                PriorKind::None,
+                EditType::Add,
+                "file_edit",
+            ),
+        );
+        pin_new_span(
+            &db,
+            span_of("s2", "src/b.rs", PriorKind::None, EditType::Add, "bash"),
+        );
+        add_touch(&db, "s2", 3100, 20);
+        db.measure_due_spans(NOW).unwrap();
+
+        let rows = db.slice(SliceDimension::Tool).unwrap();
+
+        assert_eq!(
+            rows[..2],
+            [
+                slice_row(SurvivalAnchor::Commit, Horizon::Day, "bash", 1, 5, 25),
+                slice_row(SurvivalAnchor::Commit, Horizon::Day, "file_edit", 1, 25, 25),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_model_slice_counts_only_linked_spans_and_labels_model_and_effort() {
+        let (_dir, db) = db();
+        db.commit_facts(&[
+            call_with_model("req-high", "toolu_high", Some("high")),
+            call_with_model("req-unset", "toolu_unset", None),
+        ])
+        .unwrap();
+        for (span_id, file_path, tool_use_id) in [
+            ("s-high", "src/a.rs", Some("toolu_high")),
+            ("s-unset", "src/b.rs", Some("toolu_unset")),
+            ("s-orphan", "src/c.rs", Some("toolu_missing")),
+            ("s-none", "src/d.rs", None),
+        ] {
+            pin_new_span(
+                &db,
+                NewSpan {
+                    tool_use_id: tool_use_id.map(str::to_string),
+                    ..span_of(
+                        span_id,
+                        file_path,
+                        PriorKind::None,
+                        EditType::Add,
+                        "file_edit",
+                    )
+                },
+            );
+        }
+        db.measure_due_spans(NOW).unwrap();
+
+        let rows = db.slice(SliceDimension::ModelEffort).unwrap();
+
+        let commit: Vec<(String, i64)> = rows
+            .iter()
+            .filter(|row| row.anchor == SurvivalAnchor::Commit)
+            .map(|row| (row.label.clone(), row.spans))
+            .collect();
+        assert_eq!(
+            commit,
+            vec![
+                ("claude-x · high".to_string(), 1),
+                ("claude-x · unset".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_from_before_edit_context_was_recorded_is_labeled_unknown() {
+        let (_dir, db) = db();
+        pin_new_span(&db, new_span("s1"));
+        db.lock()
+            .execute("UPDATE span SET prior_kind = NULL", [])
+            .unwrap();
+        db.measure_due_spans(NOW).unwrap();
+
+        let rows = db.slice(SliceDimension::Relationship).unwrap();
+
+        assert_eq!(rows[0].label, "unknown");
+    }
+
+    #[test]
+    fn slices_keep_each_horizon_and_anchor_apart() {
+        let (_dir, db) = db();
+        pin_new_span(&db, new_span("s1"));
+        add_touch(&db, "s1", 3000 + 30 * 3600, 5);
+        db.measure_due_spans(3000 + 10 * DAY).unwrap();
+
+        let rows = db.slice(SliceDimension::Relationship).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                slice_row(
+                    SurvivalAnchor::Commit,
+                    Horizon::Day,
+                    "known_human",
+                    1,
+                    25,
+                    25
+                ),
+                slice_row(
+                    SurvivalAnchor::Commit,
+                    Horizon::Week,
+                    "known_human",
+                    1,
+                    20,
+                    25
+                ),
+                slice_row(
+                    SurvivalAnchor::Generation,
+                    Horizon::Day,
+                    "known_human",
+                    1,
+                    25,
+                    25
+                ),
+                slice_row(
+                    SurvivalAnchor::Generation,
+                    Horizon::Week,
+                    "known_human",
+                    1,
+                    20,
+                    25
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn examples_rank_files_by_survival_and_skip_small_ones() {
+        let (_dir, db) = db();
+        pin_new_span(&db, file_span("/repo/.git", "s-good", "src/good.rs", 2000));
+        pin_new_span(&db, file_span("/repo/.git", "s-mid", "src/mid.rs", 2000));
+        pin_new_span(&db, file_span("/repo/.git", "s-bad", "src/bad.rs", 2000));
+        pin_new_span(&db, file_span("/repo/.git", "s-tiny", "src/tiny.rs", 100));
+        add_touch(&db, "s-mid", 3100, 500);
+        add_touch(&db, "s-bad", 3100, 1500);
+        add_touch(&db, "s-tiny", 3100, 100);
+        db.measure_due_spans(NOW).unwrap();
+
+        let examples = db
+            .file_examples(SurvivalAnchor::Commit, Horizon::Day, 1024, 2)
+            .unwrap();
+
+        let paths = |files: &[FileSurvival]| -> Vec<(String, i64)> {
+            files
+                .iter()
+                .map(|file| (file.file_path.clone(), file.surviving_bytes))
+                .collect()
+        };
+        assert_eq!(
+            paths(&examples.best),
+            vec![
+                ("src/good.rs".to_string(), 2000),
+                ("src/mid.rs".to_string(), 1500)
+            ]
+        );
+        assert_eq!(
+            paths(&examples.worst),
+            vec![
+                ("src/bad.rs".to_string(), 500),
+                ("src/mid.rs".to_string(), 1500)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_path_in_two_repos_is_two_examples() {
+        let (_dir, db) = db();
+        pin_new_span(&db, file_span("/one/.git", "s1", "src/a.rs", 2000));
+        pin_new_span(&db, file_span("/two/.git", "s2", "src/a.rs", 2000));
+        db.measure_due_spans(NOW).unwrap();
+
+        let examples = db
+            .file_examples(SurvivalAnchor::Commit, Horizon::Day, 1024, 5)
+            .unwrap();
+
+        let repos: Vec<&str> = examples
+            .best
+            .iter()
+            .map(|file| file.repo_key.as_str())
+            .collect();
+        assert_eq!(repos, vec!["/one/.git", "/two/.git"]);
+    }
+
+    #[test]
+    fn quality_counts_pinned_spans_and_each_link_status() {
+        let (_dir, db) = db();
+        db.commit_facts(&[call_with_model("req-1", "toolu_linked", Some("high"))])
+            .unwrap();
+        let tool_span =
+            |span_id: &str, file_path: &str, tool_use_id: Option<&str>, at: i64| NewSpan {
+                tool_use_id: tool_use_id.map(str::to_string),
+                created_at: at,
+                ..file_span("/repo/.git", span_id, file_path, 10)
+            };
+        pin_new_span(
+            &db,
+            tool_span("s-linked", "src/a.rs", Some("toolu_linked"), 1000),
+        );
+        db.insert_span(&tool_span(
+            "s-unknown",
+            "src/b.rs",
+            Some("toolu_gone"),
+            1000,
+        ))
+        .unwrap();
+        db.insert_span(&tool_span(
+            "s-pending",
+            "src/c.rs",
+            Some("toolu_later"),
+            5000,
+        ))
+        .unwrap();
+        db.insert_span(&tool_span("s-none", "src/d.rs", None, 1000))
+            .unwrap();
+        db.expire_unlinked_spans(1000 + LINK_DEADLINE_SECS).unwrap();
+
+        let quality = db.span_quality().unwrap();
+
+        assert_eq!(
+            quality,
+            SpanQuality {
+                spans: 4,
+                pinned: 1,
+                linked: 1,
+                pending: 1,
+                unknown: 1,
+                none: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_database_gives_empty_report_pieces() {
+        let (_dir, db) = db();
+
+        assert_eq!(
+            db.span_totals().unwrap(),
+            SpanTotals {
+                spans: 0,
+                bytes_written: 0,
+                bytes_alive: 0
+            }
+        );
+        assert_eq!(db.loss().unwrap().by_who, Vec::<LossShare>::new());
+        for dimension in [
+            SliceDimension::Relationship,
+            SliceDimension::EditType,
+            SliceDimension::Tool,
+            SliceDimension::ModelEffort,
+        ] {
+            assert_eq!(db.slice(dimension).unwrap(), Vec::<SliceRow>::new());
+        }
+        let examples = db
+            .file_examples(SurvivalAnchor::Commit, Horizon::Day, 1024, 3)
+            .unwrap();
+        assert_eq!(examples.best, Vec::<FileSurvival>::new());
+        assert_eq!(db.span_quality().unwrap().spans, 0);
     }
 }
