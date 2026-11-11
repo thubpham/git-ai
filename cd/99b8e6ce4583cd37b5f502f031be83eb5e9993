@@ -1,0 +1,30 @@
+src/commands/git_ai_handlers.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 57,116-118,355
+src/token_usage/facts_db.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 10,138-164,283-306,438-508,768,771,913,944,1418,1431,1433,1692-2041
+src/token_usage/survival.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 30-46,58-62
+  s_9d19adee41f8af::t_e25310f61861b8 63
+src/commands/survival.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 1-82
+tests/integration/token_usage.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 2035-2074
+src/commands/mod.rs
+  s_9d19adee41f8af::t_3f5d244c69cbc8 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "cd99b8e6ce4583cd37b5f502f031be83eb5e9993",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
