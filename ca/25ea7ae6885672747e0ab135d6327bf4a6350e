@@ -1,0 +1,38 @@
+src/token_usage/survival_demo.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 1-232
+src/token_usage/survival.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 1-2,5,7,9,11,35-36
+src/token_usage/survival_report.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 1-495
+src/commands/survival_text.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 1-806
+src/commands/survival.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 1-5,8-74,76-84,87-88,90,93-109,111-112,115-118,123-128,130,136-139,142,144-152,157-169,172-180,183-208
+src/commands/mod.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 30
+tests/integration/token_usage.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 2036,2056-2075,2079-2090,2096-2151
+src/token_usage/mod.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 21-22
+src/token_usage/facts_db.rs
+  s_9d19adee41f8af::t_8ae723fc3d620b 378-379,387-393
+  s_9d19adee41f8af::t_5303056d86c01d 394-395
+src/commands/snapshots/git_ai__commands__survival_text__tests__the_demo_report_reads_well_as_text.snap
+  s_9d19adee41f8af::t_2d8af2a48230b1 1-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "ca25ea7ae6885672747e0ab135d6327bf4a6350e",
+  "prompts": {},
+  "sessions": {
+    "s_9d19adee41f8af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f222cdc2-eb7b-4b25-9e22-4474ff0ca88a",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
