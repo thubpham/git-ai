@@ -3238,7 +3238,7 @@ mod tests {
 
         worker.expire_unlinked_spans().await;
 
-        let conn = rusqlite::Connection::open(&facts_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&facts_path).unwrap();
         let status = |span_id: &str| -> String {
             conn.query_row(
                 "SELECT link_status FROM span WHERE span_id = ?1",
