@@ -26,6 +26,7 @@ pub mod revision;
 pub mod show;
 pub mod show_prompt;
 pub mod status;
+pub mod survival;
 pub mod upgrade;
 pub mod usage;
 pub mod whoami;

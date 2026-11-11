@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params}
 use super::claude_facts::{CallFact, TranscriptFact, TurnFact};
 use super::db::{run_migrations, to_db_i64};
 use super::spans::{EditType, PriorKind, TouchKind};
+use super::survival::{Horizon, SurvivalAnchor};
 use crate::error::GitAiError;
 
 const MIGRATIONS: &[&str] = &[
@@ -134,6 +135,33 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (4);
     "#,
+    r#"
+    CREATE TABLE survival_measurement_v5 (
+        measurement_id INTEGER PRIMARY KEY,
+        span_id TEXT NOT NULL,
+        measured_at INTEGER NOT NULL,
+        committed_at INTEGER,
+        surviving_bytes INTEGER,
+        total_bytes INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        horizon TEXT,
+        anchor TEXT CHECK (anchor IN ('commit', 'generation')),
+        anchor_at INTEGER
+    );
+
+    INSERT INTO survival_measurement_v5
+        (span_id, measured_at, committed_at, surviving_bytes, total_bytes, outcome)
+    SELECT span_id, measured_at, committed_at, surviving_bytes, total_bytes, outcome
+    FROM survival_measurement;
+
+    DROP TABLE survival_measurement;
+    ALTER TABLE survival_measurement_v5 RENAME TO survival_measurement;
+
+    CREATE UNIQUE INDEX idx_survival_span_horizon_anchor
+        ON survival_measurement(span_id, horizon, anchor);
+
+    INSERT INTO schema_version (version) VALUES (5);
+    "#,
 ];
 
 fn insert_pieces(
@@ -250,6 +278,30 @@ pub struct SpanSurvival {
     pub committed_at: i64,
     pub surviving_bytes: i64,
     pub total_bytes: i64,
+}
+
+pub struct HorizonRetention {
+    pub anchor: SurvivalAnchor,
+    pub horizon: Horizon,
+    pub spans: i64,
+    pub surviving_bytes: i64,
+    pub total_bytes: i64,
+}
+
+impl HorizonRetention {
+    pub fn retention(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        self.surviving_bytes as f64 / self.total_bytes as f64
+    }
+}
+
+fn anchor_column(anchor: SurvivalAnchor) -> &'static str {
+    match anchor {
+        SurvivalAnchor::Commit => "span.pinned_at",
+        SurvivalAnchor::Generation => "span.created_at",
+    }
 }
 
 pub struct FactsDatabase {
@@ -381,6 +433,77 @@ impl FactsDatabase {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(survival)
+    }
+
+    pub fn measure_due_spans(&self, now: i64) -> Result<usize, GitAiError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut written = 0;
+        for anchor in SurvivalAnchor::ALL {
+            let start = anchor_column(anchor);
+            let sql = format!(
+                "INSERT INTO survival_measurement (
+                    span_id, measured_at, committed_at, surviving_bytes, total_bytes,
+                    outcome, horizon, anchor, anchor_at
+                 )
+                 SELECT span.span_id, :now, span.pinned_at,
+                        MAX(0, span.total_bytes - COALESCE(
+                            (SELECT SUM(touch.bytes_removed) FROM span_touch touch
+                             WHERE touch.span_id = span.span_id
+                               AND touch.touched_at <= {start} + :seconds), 0)),
+                        span.total_bytes, 'ok', :horizon, :anchor, {start}
+                 FROM span
+                 WHERE span.total_bytes > 0
+                   AND {start} IS NOT NULL
+                   AND {start} + :seconds <= :now
+                   AND NOT EXISTS (
+                       SELECT 1 FROM survival_measurement done
+                       WHERE done.span_id = span.span_id
+                         AND done.horizon = :horizon AND done.anchor = :anchor)"
+            );
+            for horizon in Horizon::ALL {
+                written += tx.execute(
+                    &sql,
+                    named_params! {
+                        ":now": now,
+                        ":seconds": horizon.seconds(),
+                        ":horizon": horizon.as_str(),
+                        ":anchor": anchor.as_str(),
+                    },
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    pub fn survival_report(&self) -> Result<Vec<HorizonRetention>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(surviving_bytes), 0), COALESCE(SUM(total_bytes), 0)
+             FROM survival_measurement
+             WHERE anchor = ?1 AND horizon = ?2
+               AND outcome = 'ok' AND surviving_bytes IS NOT NULL",
+        )?;
+        let mut report = Vec::new();
+        for anchor in SurvivalAnchor::ALL {
+            for horizon in Horizon::ALL {
+                let (spans, surviving_bytes, total_bytes): (i64, i64, i64) = stmt
+                    .query_row(params![anchor.as_str(), horizon.as_str()], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
+                if spans > 0 {
+                    report.push(HorizonRetention {
+                        anchor,
+                        horizon,
+                        spans,
+                        surviving_bytes,
+                        total_bytes,
+                    });
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn expire_unlinked_spans(&self, now: i64) -> Result<usize, GitAiError> {
@@ -642,10 +765,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -787,7 +910,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
@@ -818,7 +941,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         let stored: (Option<String>, Option<String>) = db
             .lock()
             .query_row(
@@ -1292,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn measurements_append_per_span_and_never_overwrite() {
+    fn measurements_without_a_horizon_always_append() {
         let (_dir, db) = db();
         let measure = |measured_at: i64| {
             db.lock().execute(
@@ -1305,9 +1428,9 @@ mod tests {
 
         measure(1000).unwrap();
         measure(2800).unwrap();
+        measure(2800).unwrap();
 
-        assert!(measure(2800).is_err());
-        assert_eq!(row_count(&db, "survival_measurement"), 2);
+        assert_eq!(row_count(&db, "survival_measurement"), 3);
     }
 
     #[test]
@@ -1565,5 +1688,355 @@ mod tests {
         assert!(db.commit_facts(&facts).is_err());
 
         assert_eq!(row_count(&db, "call"), 0);
+    }
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    type Measured = (String, String, i64, i64, i64);
+
+    fn measured(db: &FactsDatabase, span_id: &str, anchor: &str) -> Vec<Measured> {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT anchor, horizon, anchor_at, surviving_bytes, total_bytes
+                 FROM survival_measurement
+                 WHERE span_id = ?1 AND anchor = ?2
+                 ORDER BY anchor_at, horizon",
+            )
+            .unwrap();
+        stmt.query_map(params![span_id, anchor], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    fn row_of(anchor: &str, horizon: &str, anchor_at: i64, surviving: i64, total: i64) -> Measured {
+        (
+            anchor.to_string(),
+            horizon.to_string(),
+            anchor_at,
+            surviving,
+            total,
+        )
+    }
+
+    fn span_created_at(span_id: &str, created_at: i64) -> NewSpan {
+        NewSpan {
+            created_at,
+            ..new_span(span_id)
+        }
+    }
+
+    fn pinned_span(db: &FactsDatabase, span_id: &str, created_at: i64, pinned_at: i64) {
+        db.insert_span(&span_created_at(span_id, created_at))
+            .unwrap();
+        db.pin_spans(
+            "/repo/.git",
+            "commit-1",
+            pinned_at,
+            &blobs("src/a.rs", "blob-1"),
+        )
+        .unwrap();
+    }
+
+    fn sized_pinned_span(db: &FactsDatabase, span_id: &str, file_path: &str, length: usize) {
+        db.insert_span(&NewSpan {
+            file_path: file_path.to_string(),
+            pieces: vec![(0, length)],
+            ..new_span(span_id)
+        })
+        .unwrap();
+        db.pin_spans("/repo/.git", "commit-1", 3000, &blobs(file_path, "blob-1"))
+            .unwrap();
+    }
+
+    fn add_touch(db: &FactsDatabase, span_id: &str, touched_at: i64, bytes_removed: i64) {
+        db.lock()
+            .execute(
+                "INSERT INTO span_touch (
+                    span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
+                 ) VALUES (?1, ?2, 'ai', 'author-2', 'replace', ?3)",
+                params![span_id, touched_at, bytes_removed],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_v4_database_gains_horizon_and_anchor_columns_and_keeps_its_measurements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            for migration in &MIGRATIONS[..4] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO survival_measurement
+                    (span_id, measured_at, committed_at, surviving_bytes, total_bytes, outcome)
+                 VALUES ('span-1', 5000, 3000, 20, 25, 'ok')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 5);
+        assert_eq!(row_count(&db, "survival_measurement"), 1);
+        let stored: (Option<String>, Option<String>, Option<i64>) = db
+            .lock()
+            .query_row(
+                "SELECT horizon, anchor, anchor_at FROM survival_measurement",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None, None));
+    }
+
+    #[test]
+    fn a_measurement_is_unique_per_span_horizon_and_anchor() {
+        let (_dir, db) = db();
+        let insert = |measured_at: i64, horizon: &str, anchor: &str| {
+            db.lock().execute(
+                "INSERT INTO survival_measurement
+                    (span_id, measured_at, committed_at, surviving_bytes, total_bytes,
+                     outcome, horizon, anchor, anchor_at)
+                 VALUES ('span-1', ?1, 3000, 20, 25, 'ok', ?2, ?3, 3000)",
+                params![measured_at, horizon, anchor],
+            )
+        };
+
+        insert(5000, "24h", "commit").unwrap();
+
+        assert!(insert(6000, "24h", "commit").is_err());
+        insert(6000, "24h", "generation").unwrap();
+        insert(6000, "7d", "commit").unwrap();
+        assert_eq!(row_count(&db, "survival_measurement"), 3);
+    }
+
+    #[test]
+    fn a_span_younger_than_every_horizon_gets_no_measurement() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+
+        let written = db.measure_due_spans(1000 + DAY - 1).unwrap();
+
+        assert_eq!(written, 0);
+        assert_eq!(row_count(&db, "survival_measurement"), 0);
+    }
+
+    #[test]
+    fn a_two_day_old_span_gets_only_the_day_horizon_for_each_anchor() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+
+        let written = db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        assert_eq!(written, 2);
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![row_of("commit", "24h", 3000, 25, 25)]
+        );
+        assert_eq!(
+            measured(&db, "span-1", "generation"),
+            vec![row_of("generation", "24h", 1000, 25, 25)]
+        );
+    }
+
+    #[test]
+    fn each_horizon_row_counts_only_losses_up_to_its_own_cutoff() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+        add_touch(&db, "span-1", 3000 + 10 * 3600, 10);
+        add_touch(&db, "span-1", 3000 + 30 * 3600, 5);
+
+        db.measure_due_spans(3000 + 10 * DAY).unwrap();
+
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![
+                row_of("commit", "24h", 3000, 15, 25),
+                row_of("commit", "7d", 3000, 10, 25),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loss_exactly_at_the_cutoff_counts() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+        add_touch(&db, "span-1", 3000 + DAY, 5);
+
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![row_of("commit", "24h", 3000, 20, 25)]
+        );
+    }
+
+    #[test]
+    fn survival_never_goes_below_zero() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+        add_touch(&db, "span-1", 3100, 20);
+        add_touch(&db, "span-1", 3200, 20);
+
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![row_of("commit", "24h", 3000, 0, 25)]
+        );
+    }
+
+    #[test]
+    fn measuring_again_writes_only_the_horizons_reached_since() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+
+        assert_eq!(db.measure_due_spans(3000 + 2 * DAY).unwrap(), 2);
+        assert_eq!(db.measure_due_spans(3000 + 2 * DAY).unwrap(), 0);
+        assert_eq!(db.measure_due_spans(3000 + 10 * DAY).unwrap(), 2);
+
+        assert_eq!(row_count(&db, "survival_measurement"), 4);
+    }
+
+    #[test]
+    fn an_unpinned_span_is_measured_from_generation_only() {
+        let (_dir, db) = db();
+        db.insert_span(&span_created_at("span-1", 1000)).unwrap();
+
+        let written = db.measure_due_spans(1000 + 2 * DAY).unwrap();
+
+        assert_eq!(written, 1);
+        assert_eq!(measured(&db, "span-1", "commit"), vec![]);
+        assert_eq!(
+            measured(&db, "span-1", "generation"),
+            vec![row_of("generation", "24h", 1000, 25, 25)]
+        );
+    }
+
+    #[test]
+    fn a_span_without_a_recorded_size_is_skipped() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-null", 1000, 3000);
+        pinned_span(&db, "span-zero", 1000, 3000);
+        db.lock()
+            .execute(
+                "UPDATE span SET total_bytes = NULL WHERE span_id = 'span-null'",
+                [],
+            )
+            .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE span SET total_bytes = 0 WHERE span_id = 'span-zero'",
+                [],
+            )
+            .unwrap();
+
+        let written = db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn the_two_anchors_use_their_own_start_time_and_cutoff() {
+        let (_dir, db) = db();
+        let created = 1000;
+        let pinned = created + 5 * DAY;
+        pinned_span(&db, "span-1", created, pinned);
+        add_touch(&db, "span-1", created + 2 * 3600, 10);
+        add_touch(&db, "span-1", created + 6 * DAY + 2 * 3600, 5);
+
+        db.measure_due_spans(created + 8 * DAY).unwrap();
+
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![row_of("commit", "24h", pinned, 15, 25)]
+        );
+        assert_eq!(
+            measured(&db, "span-1", "generation"),
+            vec![
+                row_of("generation", "24h", created, 15, 25),
+                row_of("generation", "7d", created, 10, 25),
+            ]
+        );
+    }
+
+    #[test]
+    fn replaying_touches_agrees_with_the_live_pieces_after_a_real_remap() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+        db.apply_remaps(&[SpanRemap {
+            span_id: "span-1".to_string(),
+            pieces: vec![(0, 10), (45, 50)],
+            touch: Some(SpanTouch {
+                touched_at: 3100,
+                toucher_kind: "ai".to_string(),
+                toucher_id: "author-2".to_string(),
+                touch_kind: TouchKind::Replace,
+                bytes_removed: 10,
+            }),
+        }])
+        .unwrap();
+
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        let live = db.pinned_span_survival().unwrap();
+        assert_eq!(live[0].surviving_bytes, 15);
+        assert_eq!(
+            measured(&db, "span-1", "commit"),
+            vec![row_of("commit", "24h", 3000, live[0].surviving_bytes, 25)]
+        );
+    }
+
+    #[test]
+    fn the_report_pools_bytes_across_spans_instead_of_averaging_rates() {
+        let (_dir, db) = db();
+        sized_pinned_span(&db, "span-small", "src/small.rs", 10);
+        sized_pinned_span(&db, "span-large", "src/large.rs", 90);
+        add_touch(&db, "span-small", 3100, 10);
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        let report = db.survival_report().unwrap();
+
+        let commit_day: Vec<&HorizonRetention> = report
+            .iter()
+            .filter(|row| row.anchor == SurvivalAnchor::Commit && row.horizon == Horizon::Day)
+            .collect();
+        assert_eq!(commit_day.len(), 1);
+        assert_eq!(commit_day[0].spans, 2);
+        assert_eq!(commit_day[0].surviving_bytes, 90);
+        assert_eq!(commit_day[0].total_bytes, 100);
+        assert!((commit_day[0].retention() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_report_lists_only_horizons_that_have_measurements() {
+        let (_dir, db) = db();
+        pinned_span(&db, "span-1", 1000, 3000);
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        let report = db.survival_report().unwrap();
+
+        let keys: Vec<(SurvivalAnchor, Horizon)> =
+            report.iter().map(|row| (row.anchor, row.horizon)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                (SurvivalAnchor::Commit, Horizon::Day),
+                (SurvivalAnchor::Generation, Horizon::Day),
+            ]
+        );
     }
 }

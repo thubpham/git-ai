@@ -27,6 +27,23 @@ impl Horizon {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurvivalAnchor {
+    Commit,
+    Generation,
+}
+
+impl SurvivalAnchor {
+    pub const ALL: [SurvivalAnchor; 2] = [SurvivalAnchor::Commit, SurvivalAnchor::Generation];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SurvivalAnchor::Commit => "commit",
+            SurvivalAnchor::Generation => "generation",
+        }
+    }
+}
+
 pub fn horizons_reached(age_secs: i64) -> Vec<Horizon> {
     Horizon::ALL
         .into_iter()
@@ -37,6 +54,12 @@ pub fn horizons_reached(age_secs: i64) -> Vec<Horizon> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_are_named_for_storage_and_the_report() {
+        assert_eq!(SurvivalAnchor::Commit.as_str(), "commit");
+        assert_eq!(SurvivalAnchor::Generation.as_str(), "generation");
+    }
 
     #[test]
     fn a_young_span_has_reached_no_horizon() {

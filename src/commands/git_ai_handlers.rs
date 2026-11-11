@@ -54,6 +54,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "uninstall"
             | "uninstall-hooks"
             | "usage"
+            | "survival"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -111,6 +112,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "usage" => {
             commands::usage::handle_usage(&args[1..]);
+        }
+        "survival" => {
+            commands::survival::handle_survival(&args[1..]);
         }
         "analyze" => {
             commands::analyze::handle_analyze(&args[1..]);
@@ -348,6 +352,7 @@ fn print_help() {
     eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
     eprintln!("    --json                 Output in JSON format");
     eprintln!("  usage              Show local AI usage statistics");
+    eprintln!("  survival           Show how much AI-written code survives per horizon");
     eprintln!("    --period <1d|3d|7d|30d>  Time window (default: 30d)");
     eprintln!("    --json                 Output in JSON format");
     eprintln!("  analyze [beta]      Analyze agent sessions and effectiveness");

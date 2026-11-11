@@ -2032,3 +2032,43 @@ fn a_pinned_span_nobody_touched_survives_in_full() {
     assert_eq!(survival.len(), 1);
     assert_eq!(survival[0].surviving_bytes, survival[0].total_bytes);
 }
+
+#[test]
+fn the_survival_command_reports_a_span_that_has_reached_a_horizon() {
+    let (repo, _transcript_path, _file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+    sync_token_usage_pipeline(&repo);
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+    let two_days = 2 * 24 * 60 * 60;
+    git_ai::sqlite::open_with_memory_limits(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE span SET created_at = created_at - ?1, pinned_at = pinned_at - ?1",
+        [two_days],
+    )
+    .unwrap();
+
+    let report = repo.git_ai(&["survival"]).unwrap();
+
+    let day_lines: Vec<&str> = report.lines().filter(|line| line.contains("24h")).collect();
+    assert_eq!(day_lines.len(), 2, "{report}");
+    assert!(day_lines.iter().any(|line| line.contains("commit")));
+    assert!(day_lines.iter().any(|line| line.contains("generation")));
+    assert!(
+        day_lines.iter().all(|line| line.contains("100.0%")),
+        "{report}"
+    );
+    assert!(!report.contains("7d"), "{report}");
+    assert!(!report.contains("30d"), "{report}");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+}
