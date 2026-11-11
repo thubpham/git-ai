@@ -2149,3 +2149,17 @@ fn survival_age_and_anchor_flags_choose_what_the_text_report_slices() {
     assert!(report.contains("04 SLICES"), "{report}");
     assert!(report.contains("generation"), "{report}");
 }
+
+#[test]
+fn survival_html_writes_a_page_with_the_report_embedded() {
+    let repo = repo_with_a_matured_ai_line();
+    let page = repo.test_home_path().join("survival.html");
+
+    repo.git_ai(&["survival", "--html", page.to_str().unwrap()])
+        .unwrap();
+
+    let html = fs::read_to_string(&page).unwrap();
+    assert!(html.contains("<script id=\"report\" type=\"application/json\">"));
+    assert!(html.contains("SPAN SURVIVAL"));
+    assert!(html.contains("\"bytes_written\":13"));
+}

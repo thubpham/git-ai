@@ -27,6 +27,7 @@ pub mod show;
 pub mod show_prompt;
 pub mod status;
 pub mod survival;
+pub mod survival_html;
 pub mod survival_text;
 pub mod upgrade;
 pub mod usage;

@@ -1,3 +1,4 @@
+use crate::commands::survival_html::render_html;
 use crate::commands::survival_text::{View, render_text};
 use crate::token_usage::facts_db::FactsDatabase;
 use crate::token_usage::survival::{Horizon, SurvivalAnchor};
@@ -80,10 +81,6 @@ pub fn handle_survival(args: &[String]) {
             std::process::exit(1);
         }
     };
-    if options.html.is_some() {
-        eprintln!("error: --html is not available yet");
-        std::process::exit(1);
-    }
     let report = match load_report(&options) {
         Ok(report) => report,
         Err(message) => {
@@ -91,6 +88,23 @@ pub fn handle_survival(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let mut view = View::default_for(&report);
+    if let Some(anchor) = options.from {
+        view.anchor = anchor;
+    }
+    if let Some(horizon) = options.age {
+        view.horizon = horizon;
+    }
+    if let Some(path) = &options.html {
+        match std::fs::write(path, render_html(&report, view)) {
+            Ok(()) => println!("Wrote {path}"),
+            Err(error) => {
+                eprintln!("error: could not write {path}: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if options.json {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
@@ -100,13 +114,6 @@ pub fn handle_survival(args: &[String]) {
             }
         }
         return;
-    }
-    let mut view = View::default_for(&report);
-    if let Some(anchor) = options.from {
-        view.anchor = anchor;
-    }
-    if let Some(horizon) = options.age {
-        view.horizon = horizon;
     }
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     print!("{}", render_text(&report, view, color));
