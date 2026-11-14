@@ -1,0 +1,64 @@
+name: Fork release (macOS arm64)
+
+# Slim release for the TRR fork. No OSS_BUILD, so auto-update stays off.
+# Run it from the Actions tab with a tag name, e.g. v0.1.0-trr.1.
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create (e.g. v0.1.0-trr.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.93.0"
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Collect release files
+        env:
+          TAG: ${{ inputs.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir release
+          cp target/aarch64-apple-darwin/release/git-ai release/git-ai-macos-arm64
+          chmod +x release/git-ai-macos-arm64
+          (cd release && shasum -a 256 git-ai-macos-arm64 > SHA256SUMS)
+          CHECKSUMS=$(tr '\n' '|' < release/SHA256SUMS | sed 's/|$//')
+          awk -v repo="$REPO" -v version="$TAG" -v checksums="$CHECKSUMS" '
+            /^REPO="__REPO_PLACEHOLDER__"/ { sub(/__REPO_PLACEHOLDER__/, repo) }
+            /^PINNED_VERSION="__VERSION_PLACEHOLDER__"/ { sub(/__VERSION_PLACEHOLDER__/, version) }
+            /^EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"/ { sub(/__CHECKSUMS_PLACEHOLDER__/, checksums) }
+            { print }
+          ' install.sh > release/install.sh
+          chmod +x release/install.sh
+
+      - name: Smoke test binary
+        run: release/git-ai-macos-arm64 --version
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag_name }}
+        run: |
+          gh release create "$TAG" release/git-ai-macos-arm64 release/SHA256SUMS release/install.sh \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Unsigned macOS arm64 build of the TRR fork. Install: curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | bash. Auto-update is off. Do not run git-ai upgrade."
