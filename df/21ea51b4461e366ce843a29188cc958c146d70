@@ -1,0 +1,23 @@
+README.md
+  s_50581deda84f1d::t_0cb44fa73162a7 1,7,9,11,13-15,17,19,23,29,31,33-35,37,39-40,43-45,47,49,52,55,57-63,65,67,69,71-72,74-75,77-80,82-87,89-90,92-93,95,97-99,101,103,106,108-115,117,121,123
+  s_50581deda84f1d::t_58af5c5f100bb8 119
+  s_50581deda84f1d::t_4ff060b00c5c05 104
+  s_50581deda84f1d::t_538c1dcc0f9970 3,5
+  s_50581deda84f1d::t_280e94c25a8017 26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "df21ea51b4461e366ce843a29188cc958c146d70",
+  "prompts": {},
+  "sessions": {
+    "s_50581deda84f1d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3b5695f-9514-433a-ae90-08f1dc0314c9",
+        "model": "unknown"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
