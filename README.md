@@ -68,28 +68,28 @@ The report is private to your machine. Real file paths appear in the best and wo
 
 The report has six sections. This is the order they appear in.
 
-### 01 How much survives
+### 1. How much survives
 The headline. Bytes AI wrote, how many are still there, and the retention rate at 24h, 7d and 30d, once for each clock. A row only counts spans that are at least that old, so the 30d row is empty for the first month.
 
-### 02 Survival curve
+### 2. Survival curve
 The same numbers as bars, from 100% at the start down through each age. Easy to see how fast code falls away.
 
-### 03 Why it dies
+### 3. Why it dies
 Of the bytes that disappeared:
 - **who removed them:** AI, a known human edit, or untracked (a change we did not see being made).
 - **how:** replaced by new text, or deleted outright.
 
-### 04 Slices
+### 4. Slices
 Retention at the chosen age, split by how the code was written. Bars are weighted by bytes, so big edits count more. Groups with fewer than 10 spans are marked too few.
 - **What it replaced:** human code, AI code, or a fresh addition. This is the relationship view: AI over AI, AI over human.
 - **Edit type:** added or replaced.
 - **Tool:** a file edit tool or a Bash command.
 - **Model and effort:** which model at which effort level.
 
-### 05 Best and worst files
+### 5. Best and worst files
 The files whose AI code lasted longest and shortest. Files with under 1 KB of AI code are left out.
 
-### 06 Cost per surviving KB
+### 6. Cost per surviving KB
 Dollars spent on each model's calls for every kilobyte of its code that survived. This uses dollars, not token counts, because raw token totals are dominated by cache reads.
 
 ## How to read it
