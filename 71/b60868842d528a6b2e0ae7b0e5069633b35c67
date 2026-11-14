@@ -1,0 +1,19 @@
+.github/workflows/fork-release.yml
+  s_50581deda84f1d::t_f48cd519239ff9 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "71b60868842d528a6b2e0ae7b0e5069633b35c67",
+  "prompts": {},
+  "sessions": {
+    "s_50581deda84f1d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3b5695f-9514-433a-ae90-08f1dc0314c9",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
