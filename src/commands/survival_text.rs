@@ -179,6 +179,17 @@ fn headline(out: &mut Writer, report: &SurvivalReport) {
         percent(report.totals.bytes_alive as f64 / report.totals.bytes_written as f64)
     };
     out.line(format!("  Still there now    {alive}   (all ages)"));
+    let commit_rate = &report.commit_rate;
+    let committed = if commit_rate.bytes_written == 0 {
+        "–".to_string()
+    } else {
+        percent(commit_rate.rate)
+    };
+    out.line(format!(
+        "  Commit rate        {committed}   ({} committed spans, {} not committed yet)",
+        format_count(commit_rate.spans),
+        format_count(report.totals.spans - commit_rate.spans)
+    ));
     out.blank();
     if report.horizons.is_empty() {
         out.line("  No code has reached an age yet. The first row appears 24 hours after code is written.");
@@ -388,8 +399,8 @@ mod tests {
     use super::*;
     use crate::token_usage::facts_db::SliceDimension;
     use crate::token_usage::survival_report::{
-        CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality, SliceGroup,
-        SliceRowOut, Totals,
+        CommitRate, CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality,
+        SliceGroup, SliceRowOut, Totals,
     };
 
     const ESC: &str = "\u{1b}[";
@@ -438,6 +449,12 @@ mod tests {
                 spans: 1284,
                 bytes_written: 2_516_582,
                 bytes_alive: 1_535_000,
+            },
+            commit_rate: CommitRate {
+                spans: 1100,
+                bytes_written: 2_000_000,
+                bytes_committed: 1_500_000,
+                rate: 0.75,
             },
             horizons: vec![
                 horizon_row(SurvivalAnchor::Commit, Horizon::Day, 14, 90, 100),
@@ -629,6 +646,17 @@ mod tests {
         assert!(headline.contains("61%"), "{headline}");
         assert!(headline.contains("all ages"), "{headline}");
         assert!(headline.contains("Each age counts only code that old."));
+    }
+
+    #[test]
+    fn the_headline_shows_the_commit_rate_and_what_is_not_committed_yet() {
+        let text = render_text(&sample_report(), day_view(), false);
+        let headline = section(&text, "01");
+
+        assert!(headline.contains("Commit rate"), "{headline}");
+        assert!(headline.contains("75%"), "{headline}");
+        assert!(headline.contains("1,100 committed spans"), "{headline}");
+        assert!(headline.contains("184 not committed yet"), "{headline}");
     }
 
     #[test]

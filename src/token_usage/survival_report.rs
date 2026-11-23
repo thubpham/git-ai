@@ -11,6 +11,7 @@ pub const EXAMPLE_LIMIT: usize = 3;
 pub struct SurvivalReport {
     pub demo: bool,
     pub totals: Totals,
+    pub commit_rate: CommitRate,
     pub horizons: Vec<HorizonRow>,
     pub loss: LossReport,
     pub slices: Vec<SliceGroup>,
@@ -24,6 +25,14 @@ pub struct Totals {
     pub spans: i64,
     pub bytes_written: i64,
     pub bytes_alive: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitRate {
+    pub spans: i64,
+    pub bytes_written: i64,
+    pub bytes_committed: i64,
+    pub rate: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +122,12 @@ impl SurvivalReport {
                 bytes_written: 0,
                 bytes_alive: 0,
             },
+            commit_rate: CommitRate {
+                spans: 0,
+                bytes_written: 0,
+                bytes_committed: 0,
+                rate: 0.0,
+            },
             horizons: Vec::new(),
             loss: LossReport {
                 by_who: Vec::new(),
@@ -134,6 +149,7 @@ impl SurvivalReport {
 
     pub fn build(db: &FactsDatabase) -> Result<SurvivalReport, GitAiError> {
         let totals = db.span_totals()?;
+        let commit_rate = db.commit_rate()?;
         let loss = db.loss()?;
         let quality = db.span_quality()?;
         let mut slices: Vec<SliceGroup> = Vec::new();
@@ -184,6 +200,12 @@ impl SurvivalReport {
                 spans: totals.spans,
                 bytes_written: totals.bytes_written,
                 bytes_alive: totals.bytes_alive,
+            },
+            commit_rate: CommitRate {
+                rate: ratio(commit_rate.bytes_committed, commit_rate.bytes_written),
+                spans: commit_rate.spans,
+                bytes_written: commit_rate.bytes_written,
+                bytes_committed: commit_rate.bytes_committed,
             },
             horizons: db
                 .survival_report()?
@@ -340,6 +362,15 @@ mod tests {
         assert!(!report.demo);
         assert_eq!(report.totals.spans, 2);
         assert_eq!(report.totals.bytes_written, 4000);
+        assert_eq!(
+            report.commit_rate,
+            CommitRate {
+                spans: 2,
+                bytes_written: 4000,
+                bytes_committed: 4000,
+                rate: 1.0,
+            }
+        );
         assert_eq!(report.horizons.len(), 2);
         assert_eq!(report.horizons[0].anchor, SurvivalAnchor::Commit);
         assert_eq!(report.horizons[0].horizon, Horizon::Day);

@@ -120,6 +120,8 @@ const head = (n, title, desc) => `<h2>${n} ${title}</h2><p class="desc">${desc}<
 function s01() {
   const row = rowAt(state.anchor, state.hz);
   const alive = R.totals.bytes_written ? pct(R.totals.bytes_alive / R.totals.bytes_written) : '–';
+  const C = R.commit_rate;
+  const committed = C.bytes_written ? pct(C.rate) : '–';
   const others = HZ.filter(h => h !== state.hz).map(h => {
     const r = rowAt(state.anchor, h);
     return r
@@ -134,6 +136,7 @@ function s01() {
     + `<div class="card big"><div>RETENTION @ ${state.hz.toUpperCase()}</div><div class="v" id="big" data-target="${row ? Math.round(row.retention * 100) : ''}">${row ? '0%' : '–'}</div><div>${row ? 'n=' + count(row.spans) + ' spans' : 'not yet'}</div></div>`
     + `<div class="card yellow"><div class="k">AI BYTES WRITTEN</div><div class="v">${bytes(R.totals.bytes_written)}</div><div class="n">n=${count(R.totals.spans)} spans</div></div>`
     + `<div class="card mint"><div class="k">STILL THERE NOW</div><div class="v">${alive}</div><div class="n">all ages</div></div>`
+    + `<div class="card"><div class="k">COMMIT RATE</div><div class="v">${committed}</div><div class="n">n=${count(C.spans)} committed spans</div></div>`
     + others + `</div>${empty}`;
 }
 

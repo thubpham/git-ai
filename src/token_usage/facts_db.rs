@@ -162,7 +162,35 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (5);
     "#,
+    r#"
+    ALTER TABLE span ADD COLUMN committed_bytes INTEGER;
+    ALTER TABLE span_touch ADD COLUMN phase TEXT
+        CHECK (phase IN ('pre_commit', 'post_commit'));
+
+    UPDATE span_touch SET phase = CASE
+        WHEN EXISTS (
+            SELECT 1 FROM span
+            WHERE span.span_id = span_touch.span_id
+              AND span.pinned_at IS NOT NULL
+              AND span_touch.touched_at > span.pinned_at)
+        THEN 'post_commit' ELSE 'pre_commit' END;
+
+    UPDATE span SET committed_bytes = MAX(0, total_bytes - COALESCE(
+        (SELECT SUM(touch.bytes_removed) FROM span_touch touch
+         WHERE touch.span_id = span.span_id AND touch.phase = 'pre_commit'), 0))
+    WHERE pinned_at IS NOT NULL AND total_bytes IS NOT NULL;
+
+    DELETE FROM survival_measurement WHERE anchor = 'commit';
+
+    INSERT INTO schema_version (version) VALUES (6);
+    "#,
 ];
+
+const INSERT_TOUCH: &str = "INSERT INTO span_touch (
+        span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed, phase
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+        CASE WHEN (SELECT pinned_commit FROM span WHERE span_id = ?1) IS NULL
+             THEN 'pre_commit' ELSE 'post_commit' END)";
 
 fn loss_by(conn: &Connection, column: &str) -> Result<Vec<LossShare>, GitAiError> {
     let mut stmt = conn.prepare(&format!(
@@ -349,11 +377,32 @@ impl HorizonRetention {
     }
 }
 
-fn anchor_column(anchor: SurvivalAnchor) -> &'static str {
+struct AnchorBasis {
+    start: &'static str,
+    size: &'static str,
+    losses: &'static str,
+}
+
+fn anchor_basis(anchor: SurvivalAnchor) -> AnchorBasis {
     match anchor {
-        SurvivalAnchor::Commit => "span.pinned_at",
-        SurvivalAnchor::Generation => "span.created_at",
+        SurvivalAnchor::Commit => AnchorBasis {
+            start: "span.pinned_at",
+            size: "span.committed_bytes",
+            losses: "AND touch.phase = 'post_commit'",
+        },
+        SurvivalAnchor::Generation => AnchorBasis {
+            start: "span.created_at",
+            size: "span.total_bytes",
+            losses: "",
+        },
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRateTotals {
+    pub spans: i64,
+    pub bytes_written: i64,
+    pub bytes_committed: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,20 +612,25 @@ impl FactsDatabase {
         let tx = conn.transaction()?;
         let mut written = 0;
         for anchor in SurvivalAnchor::ALL {
-            let start = anchor_column(anchor);
+            let AnchorBasis {
+                start,
+                size,
+                losses,
+            } = anchor_basis(anchor);
             let sql = format!(
                 "INSERT INTO survival_measurement (
                     span_id, measured_at, committed_at, surviving_bytes, total_bytes,
                     outcome, horizon, anchor, anchor_at
                  )
                  SELECT span.span_id, :now, span.pinned_at,
-                        MAX(0, span.total_bytes - COALESCE(
+                        MAX(0, {size} - COALESCE(
                             (SELECT SUM(touch.bytes_removed) FROM span_touch touch
-                             WHERE touch.span_id = span.span_id
+                             WHERE touch.span_id = span.span_id {losses}
                                AND touch.touched_at <= {start} + :seconds), 0)),
-                        span.total_bytes, 'ok', :horizon, :anchor, {start}
+                        {size}, 'ok', :horizon, :anchor, {start}
                  FROM span
                  WHERE span.total_bytes > 0
+                   AND {size} > 0
                    AND {start} IS NOT NULL
                    AND {start} + :seconds <= :now
                    AND NOT EXISTS (
@@ -645,6 +699,21 @@ impl FactsDatabase {
             spans,
             bytes_written,
             bytes_alive,
+        })
+    }
+
+    pub fn commit_rate(&self) -> Result<CommitRateTotals, GitAiError> {
+        let conn = self.lock();
+        let (spans, bytes_written, bytes_committed) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(total_bytes), 0), COALESCE(SUM(committed_bytes), 0)
+             FROM span WHERE total_bytes > 0 AND committed_bytes IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(CommitRateTotals {
+            spans,
+            bytes_written,
+            bytes_committed,
         })
     }
 
@@ -769,7 +838,10 @@ impl FactsDatabase {
         let tx = conn.transaction()?;
         for (file_path, blob_sha) in blobs {
             tx.execute(
-                "UPDATE span SET pinned_commit = ?1, pinned_blob = ?2, pinned_at = ?3
+                "UPDATE span SET pinned_commit = ?1, pinned_blob = ?2, pinned_at = ?3,
+                    committed_bytes = (SELECT COALESCE(SUM(piece.end_byte - piece.start_byte), 0)
+                                       FROM span_piece piece
+                                       WHERE piece.span_id = span.span_id)
                  WHERE repo_key = ?4 AND file_path = ?5 AND pinned_commit IS NULL",
                 params![commit_sha, blob_sha, pinned_at, repo_key, file_path],
             )?;
@@ -789,9 +861,7 @@ impl FactsDatabase {
             insert_pieces(&tx, &remap.span_id, &remap.pieces)?;
             if let Some(touch) = &remap.touch {
                 tx.execute(
-                    "INSERT INTO span_touch (
-                        span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    INSERT_TOUCH,
                     params![
                         remap.span_id,
                         touch.touched_at,
@@ -995,10 +1065,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -1140,7 +1210,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
@@ -1171,7 +1241,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         let stored: (Option<String>, Option<String>) = db
             .lock()
             .query_row(
@@ -1991,10 +2061,15 @@ mod tests {
     fn add_touch(db: &FactsDatabase, span_id: &str, touched_at: i64, bytes_removed: i64) {
         db.lock()
             .execute(
-                "INSERT INTO span_touch (
-                    span_id, touched_at, toucher_kind, toucher_id, touch_kind, bytes_removed
-                 ) VALUES (?1, ?2, 'ai', 'author-2', 'replace', ?3)",
-                params![span_id, touched_at, bytes_removed],
+                INSERT_TOUCH,
+                params![
+                    span_id,
+                    touched_at,
+                    "ai",
+                    "author-2",
+                    "replace",
+                    bytes_removed
+                ],
             )
             .unwrap();
     }
@@ -2019,7 +2094,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         assert_eq!(row_count(&db, "survival_measurement"), 1);
         let stored: (Option<String>, Option<String>, Option<i64>) = db
             .lock()
@@ -2179,20 +2254,174 @@ mod tests {
         assert_eq!(written, 0);
     }
 
+    fn remap_with_loss(
+        db: &FactsDatabase,
+        span_id: &str,
+        pieces: Vec<(usize, usize)>,
+        touched_at: i64,
+        bytes_removed: usize,
+    ) {
+        db.apply_remaps(&[SpanRemap {
+            span_id: span_id.to_string(),
+            pieces,
+            touch: Some(SpanTouch {
+                touched_at,
+                toucher_kind: "ai".to_string(),
+                toucher_id: "author-2".to_string(),
+                touch_kind: TouchKind::Replace,
+                bytes_removed,
+            }),
+        }])
+        .unwrap();
+    }
+
+    fn phases(db: &FactsDatabase, span_id: &str) -> Vec<String> {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare("SELECT phase FROM span_touch WHERE span_id = ?1 ORDER BY touch_id")
+            .unwrap();
+        stmt.query_map(params![span_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn committed_bytes(db: &FactsDatabase, span_id: &str) -> Option<i64> {
+        db.lock()
+            .query_row(
+                "SELECT committed_bytes FROM span WHERE span_id = ?1",
+                params![span_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_touch_is_pre_commit_until_its_span_is_pinned_and_post_commit_after() {
+        let (_dir, db) = db();
+        db.insert_span(&span_created_at("span-1", 1000)).unwrap();
+
+        remap_with_loss(&db, "span-1", vec![(0, 15)], 1100, 10);
+        db.pin_spans("/repo/.git", "commit-1", 1200, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+        remap_with_loss(&db, "span-1", vec![(0, 10)], 1150, 5);
+
+        assert_eq!(phases(&db, "span-1"), vec!["pre_commit", "post_commit"]);
+    }
+
+    #[test]
+    fn pinning_records_the_bytes_still_alive_as_committed_bytes() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-shrunk")).unwrap();
+        db.insert_span(&new_span("span-dead")).unwrap();
+        remap_with_loss(&db, "span-shrunk", vec![(0, 15)], 1100, 10);
+        remap_with_loss(&db, "span-dead", vec![], 1100, 25);
+
+        db.pin_spans("/repo/.git", "commit-1", 1200, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        assert_eq!(committed_bytes(&db, "span-shrunk"), Some(15));
+        assert_eq!(committed_bytes(&db, "span-dead"), Some(0));
+    }
+
+    #[test]
+    fn a_span_that_died_before_its_commit_gets_no_commit_measurement() {
+        let (_dir, db) = db();
+        db.insert_span(&span_created_at("span-1", 1000)).unwrap();
+        remap_with_loss(&db, "span-1", vec![], 1100, 25);
+        db.pin_spans("/repo/.git", "commit-1", 1200, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+
+        db.measure_due_spans(1200 + 2 * DAY).unwrap();
+
+        assert_eq!(measured(&db, "span-1", "commit"), vec![]);
+        assert_eq!(
+            measured(&db, "span-1", "generation"),
+            vec![row_of("generation", "24h", 1000, 0, 25)]
+        );
+    }
+
+    #[test]
+    fn commit_rate_pools_committed_bytes_over_committed_spans_only() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-shrunk")).unwrap();
+        db.insert_span(&new_span("span-whole")).unwrap();
+        remap_with_loss(&db, "span-shrunk", vec![(0, 15)], 1100, 10);
+        db.pin_spans("/repo/.git", "commit-1", 1200, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+        db.insert_span(&new_span("span-pending")).unwrap();
+
+        assert_eq!(
+            db.commit_rate().unwrap(),
+            CommitRateTotals {
+                spans: 2,
+                bytes_written: 50,
+                bytes_committed: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn a_v5_database_backfills_commit_phases_and_drops_commit_measurements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            for migration in &MIGRATIONS[..5] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO span (span_id, session_id, repo_key, file_path, author_kind,
+                                   author_id, source, content_hash, created_at,
+                                   pinned_commit, pinned_at, total_bytes)
+                 VALUES ('span-1', 's1', '/repo/.git', 'src/a.rs', 'ai', 'author-1',
+                         'file_edit', 'hash-1', 1000, 'commit-1', 3000, 25);
+                 INSERT INTO span_touch (span_id, touched_at, toucher_kind, toucher_id,
+                                         touch_kind, bytes_removed)
+                 VALUES ('span-1', 2000, 'ai', 'author-2', 'replace', 10),
+                        ('span-1', 4000, 'ai', 'author-2', 'replace', 5);
+                 INSERT INTO survival_measurement (span_id, measured_at, committed_at,
+                     surviving_bytes, total_bytes, outcome, horizon, anchor, anchor_at)
+                 VALUES ('span-1', 9000, 3000, 10, 25, 'ok', '24h', 'commit', 3000),
+                        ('span-1', 9000, 3000, 10, 25, 'ok', '24h', 'generation', 1000);",
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 6);
+        assert_eq!(committed_bytes(&db, "span-1"), Some(15));
+        assert_eq!(phases(&db, "span-1"), vec!["pre_commit", "post_commit"]);
+        assert_eq!(measured(&db, "span-1", "commit"), vec![]);
+        assert_eq!(
+            measured(&db, "span-1", "generation"),
+            vec![row_of("generation", "24h", 1000, 10, 25)]
+        );
+    }
+
     #[test]
     fn the_two_anchors_use_their_own_start_time_and_cutoff() {
         let (_dir, db) = db();
         let created = 1000;
         let pinned = created + 5 * DAY;
-        pinned_span(&db, "span-1", created, pinned);
-        add_touch(&db, "span-1", created + 2 * 3600, 10);
-        add_touch(&db, "span-1", created + 6 * DAY + 2 * 3600, 5);
+        db.insert_span(&span_created_at("span-1", created)).unwrap();
+        remap_with_loss(&db, "span-1", vec![(0, 15)], created + 2 * 3600, 10);
+        db.pin_spans(
+            "/repo/.git",
+            "commit-1",
+            pinned,
+            &blobs("src/a.rs", "blob-1"),
+        )
+        .unwrap();
+        remap_with_loss(&db, "span-1", vec![(0, 10)], pinned + 2 * 3600, 5);
 
         db.measure_due_spans(created + 8 * DAY).unwrap();
 
+        assert_eq!(committed_bytes(&db, "span-1"), Some(15));
         assert_eq!(
             measured(&db, "span-1", "commit"),
-            vec![row_of("commit", "24h", pinned, 15, 25)]
+            vec![row_of("commit", "24h", pinned, 10, 15)]
         );
         assert_eq!(
             measured(&db, "span-1", "generation"),

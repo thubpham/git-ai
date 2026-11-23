@@ -767,7 +767,7 @@ fn record_span(
     }
 }
 
-pub fn pin_spans_for_commit(repo: &Repository, commit_sha: &str) {
+pub fn pin_spans_for_commit(repo: &Repository, commit_sha: &str, committed_at: i64) {
     let Some(facts_db) = crate::token_usage::facts_db::shared() else {
         return;
     };
@@ -786,10 +786,7 @@ pub fn pin_spans_for_commit(repo: &Repository, commit_sha: &str) {
             return;
         }
     };
-    let pinned_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64);
-    if let Err(error) = facts_db.pin_spans(&repo_key, commit_sha, pinned_at, &blobs) {
+    if let Err(error) = facts_db.pin_spans(&repo_key, commit_sha, committed_at, &blobs) {
         tracing::warn!(%error, commit_sha, "failed to pin spans");
     }
 }

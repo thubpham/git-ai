@@ -4475,7 +4475,7 @@ fn reflog_timestamp_window(cmd: &NormalizedCommand) -> ReflogTimestampWindow {
     }
 }
 
-fn unix_nanos_to_reflog_secs(value: u128) -> i64 {
+pub(crate) fn unix_nanos_to_reflog_secs(value: u128) -> i64 {
     i64::try_from(value / 1_000_000_000).unwrap_or(i64::MAX)
 }
 

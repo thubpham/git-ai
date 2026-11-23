@@ -7878,7 +7878,13 @@ impl ActorDaemonCoordinator {
                                 )
                             })?;
                             run_blocking_side_effect(|| {
-                                crate::daemon::checkpoint::pin_spans_for_commit(&repo, new_head)
+                                crate::daemon::checkpoint::pin_spans_for_commit(
+                                    &repo,
+                                    new_head,
+                                    crate::daemon::ref_cursor::unix_nanos_to_reflog_secs(
+                                        cmd.finished_at_ns,
+                                    ),
+                                )
                             });
 
                             if !lite_mode

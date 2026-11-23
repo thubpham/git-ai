@@ -2033,6 +2033,133 @@ fn a_pinned_span_nobody_touched_survives_in_full() {
     assert_eq!(survival[0].surviving_bytes, survival[0].total_bytes);
 }
 
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn committed_bytes_by_tool_use(repo: &TestRepo) -> Vec<(String, Option<i64>)> {
+    let db = token_usage_db(repo);
+    let mut spans = db
+        .prepare(
+            "SELECT tool_use_id, committed_bytes FROM span
+             WHERE author_kind = 'ai' ORDER BY tool_use_id",
+        )
+        .unwrap();
+    spans
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|span| span.unwrap())
+        .collect()
+}
+
+fn touch_phases(repo: &TestRepo) -> Vec<(String, i64)> {
+    let db = token_usage_db(repo);
+    let mut touches = db
+        .prepare("SELECT phase, bytes_removed FROM span_touch ORDER BY touch_id")
+        .unwrap();
+    touches
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|touch| touch.unwrap())
+        .collect()
+}
+
+#[test]
+fn edits_before_a_commit_count_toward_commit_rate_and_only_later_edits_count_against_survival() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\nconst y = 3;\n",
+    );
+
+    let before_commit = unix_now_secs();
+    repo.stage_all_and_commit("add y").unwrap();
+    let after_commit = unix_now_secs();
+    sync_token_usage_pipeline(&repo);
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 3;".ai(),
+    ]);
+    let pinned_at: i64 = token_usage_db(&repo)
+        .query_row(
+            "SELECT pinned_at FROM span WHERE tool_use_id = 'toolu_edit_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        (before_commit..=after_commit).contains(&pinned_at),
+        "pinned_at {pinned_at} should be the commit time, between {before_commit} and {after_commit}"
+    );
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_3",
+        "prompt-3",
+        "const x = 1;\nconst z = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    assert_eq!(
+        committed_bytes_by_tool_use(&repo),
+        vec![
+            ("toolu_edit_1".to_string(), Some(12)),
+            ("toolu_edit_2".to_string(), Some(1)),
+            ("toolu_edit_3".to_string(), None),
+        ]
+    );
+    assert_eq!(
+        touch_phases(&repo),
+        vec![
+            ("pre_commit".to_string(), 1),
+            ("post_commit".to_string(), 2)
+        ]
+    );
+
+    let two_days = 2 * 24 * 60 * 60;
+    let writable = git_ai::sqlite::open_with_memory_limits(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+    )
+    .unwrap();
+    writable
+        .execute(
+            "UPDATE span SET created_at = created_at - ?1, pinned_at = pinned_at - ?1",
+            [two_days],
+        )
+        .unwrap();
+    writable
+        .execute(
+            "UPDATE span_touch SET touched_at = touched_at - ?1",
+            [two_days],
+        )
+        .unwrap();
+
+    let report = survival_json(&repo, &[]);
+
+    assert_eq!(report["commit_rate"]["spans"], 2);
+    assert_eq!(report["commit_rate"]["bytes_written"], 14);
+    assert_eq!(report["commit_rate"]["bytes_committed"], 13);
+    let horizons = report["horizons"].as_array().unwrap();
+    assert_eq!(horizons[0]["anchor"], "commit");
+    assert_eq!(horizons[0]["horizon"], "24h");
+    assert_eq!(horizons[0]["spans"], 2);
+    assert_eq!(horizons[0]["surviving_bytes"], 11);
+    assert_eq!(horizons[0]["total_bytes"], 13);
+}
+
 fn repo_with_a_matured_ai_line() -> TestRepo {
     let (repo, _transcript_path, _file_path) = repo_with_one_ai_line();
     repo.stage_all_and_commit("add y").unwrap();

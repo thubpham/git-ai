@@ -12,6 +12,7 @@ Of the bytes AI wrote, the share still in the code after 24 hours, 7 days and 30
 
   AI bytes written   2.4 MB   (1,284 spans)
   Still there now    61%   (all ages)
+  Commit rate        76%   (1,150 committed spans, 134 not committed yet)
 
   from        age    spans  surviving    written  retention
   commit      24h    1,284  2,063,597  2,516,582      82.0%

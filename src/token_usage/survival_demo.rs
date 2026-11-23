@@ -1,8 +1,8 @@
 use super::facts_db::SliceDimension;
 use super::survival::{Horizon, SurvivalAnchor};
 use super::survival_report::{
-    CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality, SliceGroup,
-    SliceRowOut, SurvivalReport, Totals,
+    CommitRate, CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality,
+    SliceGroup, SliceRowOut, SurvivalReport, Totals,
 };
 
 const AVERAGE_SPAN_BYTES: i64 = 6000;
@@ -193,6 +193,12 @@ impl SurvivalReport {
                 spans: 1284,
                 bytes_written: 2_516_582,
                 bytes_alive: 1_535_000,
+            },
+            commit_rate: CommitRate {
+                spans: 1150,
+                bytes_written: 2_250_000,
+                bytes_committed: 1_710_000,
+                rate: 0.76,
             },
             horizons: AGES.iter().map(horizon_row).collect(),
             loss: LossReport {
