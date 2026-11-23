@@ -731,8 +731,10 @@ impl FactsDatabase {
             SliceDimension::EditType => ("COALESCE(span.edit_type, 'unknown')", ""),
             SliceDimension::Tool => ("span.source", ""),
             SliceDimension::ModelEffort => (
-                "COALESCE(call.model, 'unknown') || ' · ' || COALESCE(call.effort, 'unset')",
-                "JOIN call ON call.request_id = span.request_id",
+                "CASE WHEN call.request_id IS NULL THEN 'unlinked'
+                      ELSE COALESCE(call.model, 'unknown') || ' · ' || COALESCE(call.effort, 'unset')
+                 END",
+                "LEFT JOIN call ON call.request_id = span.request_id",
             ),
         };
         let conn = self.lock();
@@ -2804,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_slice_counts_only_linked_spans_and_labels_model_and_effort() {
+    fn a_model_slice_labels_model_and_effort_and_keeps_spans_without_a_call_as_unlinked() {
         let (_dir, db) = db();
         db.commit_facts(&[
             call_with_model("req-high", "toolu_high", Some("high")),
@@ -2845,6 +2847,7 @@ mod tests {
             vec![
                 ("claude-x · high".to_string(), 1),
                 ("claude-x · unset".to_string(), 1),
+                ("unlinked".to_string(), 2),
             ]
         );
     }

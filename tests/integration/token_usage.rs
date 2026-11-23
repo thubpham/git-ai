@@ -2222,6 +2222,28 @@ fn the_survival_text_report_lists_the_matured_span_in_its_headline_table() {
 }
 
 #[test]
+fn an_ai_span_without_a_linked_model_call_is_its_own_row_in_the_model_slice() {
+    let repo = repo_with_a_matured_ai_line();
+
+    let report = survival_json(&repo, &[]);
+
+    let group = report["slices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| {
+            group["dimension"] == "model_effort"
+                && group["anchor"] == "commit"
+                && group["horizon"] == "24h"
+        })
+        .expect("model_effort slice for commit at 24h");
+    let rows = group["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["label"], "unlinked");
+    assert_eq!(rows[0]["spans"], 1);
+}
+
+#[test]
 fn the_survival_json_carries_the_measured_age_and_the_totals() {
     let repo = repo_with_a_matured_ai_line();
 
