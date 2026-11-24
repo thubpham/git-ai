@@ -1662,6 +1662,88 @@ fn an_untracked_edit_above_a_span_shifts_it_without_a_touch() {
     assert_eq!(touch_rows(&repo), vec![]);
 }
 
+fn repo_with_an_ai_span_on_main_and_an_ai_edit_on_feature()
+-> (TestRepo, std::path::PathBuf, std::path::PathBuf) {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+    sync_token_usage_pipeline(&repo);
+    assert_eq!(span_rows(&repo, "ai")[0].pieces, vec![(13, 26)]);
+
+    repo.git(&["switch", "-c", "feature", "HEAD~1"]).unwrap();
+    fs::write(
+        &file_path,
+        "// feature header one\n// feature header two\nconst x = 1;\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("feature header").unwrap();
+    file.assert_committed_lines(lines![
+        "// feature header one".unattributed_human(),
+        "// feature header two".unattributed_human(),
+        "const x = 1;".unattributed_human(),
+    ]);
+
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "// feature header ONE\n// feature header two\nconst x = 1;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+    (repo, transcript_path, file_path)
+}
+
+#[test]
+fn an_ai_edit_on_another_branch_does_not_touch_a_span_committed_on_the_first_branch() {
+    let (repo, _transcript_path, _file_path) =
+        repo_with_an_ai_span_on_main_and_an_ai_edit_on_feature();
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai[0].tool_use_id.as_deref(), Some("toolu_edit_1"));
+    assert_eq!(ai[0].pieces, vec![(13, 26)]);
+    assert_eq!(touch_rows(&repo), vec![]);
+}
+
+#[test]
+fn a_span_frozen_on_another_branch_is_tracked_again_after_switching_back() {
+    let (repo, transcript_path, file_path) =
+        repo_with_an_ai_span_on_main_and_an_ai_edit_on_feature();
+    repo.stage_all_and_commit("feature header edit").unwrap();
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "// feature header ONE".ai(),
+        "// feature header two".unattributed_human(),
+        "const x = 1;".unattributed_human(),
+    ]);
+
+    repo.git(&["switch", "-"]).unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_3",
+        "prompt-3",
+        "const x = 1;\nconst y = 3;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+
+    let ai = span_rows(&repo, "ai");
+    assert_eq!(ai[0].tool_use_id.as_deref(), Some("toolu_edit_1"));
+    assert_eq!(ai[0].pieces, vec![(13, 23), (24, 26)]);
+    assert_eq!(
+        touch_rows(&repo),
+        vec![("ai".to_string(), "replace".to_string(), 1)]
+    );
+}
+
 #[test]
 fn a_known_human_edit_inside_a_span_splits_it_and_records_the_touch() {
     let (repo, _transcript_path, file_path) = repo_with_one_ai_line();

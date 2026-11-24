@@ -569,10 +569,7 @@ fn save_current_file_states(
                 })?;
 
                 crate::tokio_runtime::spawn_blocking_result(move || {
-                    // Create SHA256 hash of the content
-                    let mut hasher = Sha256::new();
-                    hasher.update(content.as_bytes());
-                    let sha = format!("{:x}", hasher.finalize());
+                    let sha = sha256_hex(&content);
 
                     // Ensure blobs directory exists
                     std::fs::create_dir_all(&*blobs_dir)?;
@@ -602,6 +599,12 @@ fn save_current_file_states(
     })?;
 
     Ok(file_content_hashes)
+}
+
+fn sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn get_previous_content_from_head(
@@ -700,6 +703,20 @@ fn record_span(
     if live_spans.is_empty() && !records_span {
         return;
     }
+    let previous_hash = sha256_hex(previous_content);
+    let live_spans: Vec<_> = live_spans
+        .into_iter()
+        .filter(|span| {
+            span.file_hash
+                .as_deref()
+                .is_none_or(|file_hash| file_hash == previous_hash)
+        })
+        .collect();
+    if live_spans.is_empty() && !records_span {
+        return;
+    }
+    let tracked_span_ids: Vec<String> =
+        live_spans.iter().map(|span| span.span_id.clone()).collect();
     let segments = match AttributionTracker::new().compute_diff_segments(previous_content, content)
     {
         Ok(segments) => segments,
@@ -739,6 +756,13 @@ fn record_span(
         && let Err(error) = context.facts_db.apply_remaps(&remaps)
     {
         tracing::warn!(%error, file_path, "failed to apply span remaps");
+    }
+    if !tracked_span_ids.is_empty()
+        && let Err(error) = context
+            .facts_db
+            .refresh_file_hash(&tracked_span_ids, blob_sha)
+    {
+        tracing::warn!(%error, file_path, "failed to refresh span file hashes");
     }
     if !records_span {
         return;

@@ -184,6 +184,11 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (6);
     "#,
+    r#"
+    ALTER TABLE span ADD COLUMN file_hash TEXT;
+
+    INSERT INTO schema_version (version) VALUES (7);
+    "#,
 ];
 
 const INSERT_TOUCH: &str = "INSERT INTO span_touch (
@@ -336,6 +341,7 @@ pub struct NewSpan {
 pub struct LiveSpan {
     pub span_id: String,
     pub author_id: String,
+    pub file_hash: Option<String>,
     pub pieces: Vec<(usize, usize)>,
 }
 
@@ -520,8 +526,10 @@ impl FactsDatabase {
             "INSERT INTO span (
                 span_id, session_id, tool_use_id, prompt_id, repo_key, file_path,
                 author_kind, author_id, source, content_hash, created_at,
-                prior_kind, edit_type, total_bytes, request_id, link_status, next_link_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                prior_kind, edit_type, total_bytes, request_id, link_status, next_link_at,
+                file_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                ?10)",
             params![
                 span.span_id,
                 span.session_id,
@@ -553,7 +561,7 @@ impl FactsDatabase {
     pub fn live_spans(&self, repo_key: &str, file_path: &str) -> Result<Vec<LiveSpan>, GitAiError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT piece.span_id, span.author_id, piece.start_byte, piece.end_byte
+            "SELECT piece.span_id, span.author_id, span.file_hash, piece.start_byte, piece.end_byte
              FROM span_piece piece JOIN span ON span.span_id = piece.span_id
              WHERE span.repo_key = ?1 AND span.file_path = ?2
              ORDER BY piece.span_id, piece.piece_index",
@@ -562,24 +570,43 @@ impl FactsDatabase {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut spans: Vec<LiveSpan> = Vec::new();
         for row in rows {
-            let (span_id, author_id, start, end) = row?;
+            let (span_id, author_id, file_hash, start, end) = row?;
             let piece = (start as usize, end as usize);
             match spans.last_mut() {
                 Some(last) if last.span_id == span_id => last.pieces.push(piece),
                 _ => spans.push(LiveSpan {
                     span_id,
                     author_id,
+                    file_hash,
                     pieces: vec![piece],
                 }),
             }
         }
         Ok(spans)
+    }
+
+    pub fn refresh_file_hash(
+        &self,
+        span_ids: &[String],
+        file_hash: &str,
+    ) -> Result<(), GitAiError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for span_id in span_ids {
+            tx.execute(
+                "UPDATE span SET file_hash = ?1 WHERE span_id = ?2",
+                params![file_hash, span_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn pinned_span_survival(&self) -> Result<Vec<SpanSurvival>, GitAiError> {
@@ -1067,10 +1094,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -1212,7 +1239,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
@@ -1243,7 +1270,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         let stored: (Option<String>, Option<String>) = db
             .lock()
             .query_row(
@@ -1311,6 +1338,54 @@ mod tests {
         assert_eq!(live[0].span_id, "span-1");
         assert_eq!(live[0].author_id, "author-1");
         assert_eq!(live[0].pieces, vec![(0, 10), (40, 55)]);
+        assert_eq!(live[0].file_hash.as_deref(), Some("hash-1"));
+    }
+
+    #[test]
+    fn refreshing_the_file_hash_changes_only_the_listed_spans() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-1")).unwrap();
+        db.insert_span(&new_span("span-2")).unwrap();
+
+        db.refresh_file_hash(&["span-1".to_string()], "hash-2")
+            .unwrap();
+
+        let live = db.live_spans("/repo/.git", "src/a.rs").unwrap();
+        let hashes: Vec<(&str, Option<&str>)> = live
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.file_hash.as_deref()))
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![("span-1", Some("hash-2")), ("span-2", Some("hash-1"))]
+        );
+    }
+
+    #[test]
+    fn a_v6_database_leaves_existing_spans_without_a_file_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            for migration in &MIGRATIONS[..6] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO span (span_id, session_id, repo_key, file_path, author_kind,
+                                   author_id, source, content_hash, created_at, total_bytes)
+                 VALUES ('span-1', 's1', '/repo/.git', 'src/a.rs', 'ai', 'author-1',
+                         'file_edit', 'hash-1', 1000, 25);
+                 INSERT INTO span_piece (span_id, piece_index, start_byte, end_byte)
+                 VALUES ('span-1', 0, 0, 25);",
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 7);
+        let live = db.live_spans("/repo/.git", "src/a.rs").unwrap();
+        assert_eq!(live[0].file_hash, None);
     }
 
     #[test]
@@ -2096,7 +2171,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         assert_eq!(row_count(&db, "survival_measurement"), 1);
         let stored: (Option<String>, Option<String>, Option<i64>) = db
             .lock()
@@ -2392,7 +2467,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         assert_eq!(committed_bytes(&db, "span-1"), Some(15));
         assert_eq!(phases(&db, "span-1"), vec!["pre_commit", "post_commit"]);
         assert_eq!(measured(&db, "span-1", "commit"), vec![]);
