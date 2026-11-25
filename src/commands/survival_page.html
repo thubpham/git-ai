@@ -207,11 +207,12 @@ function s05() {
 }
 
 function s06() {
-  const most = R.cost ? Math.max(...R.cost.map(c => c.dollars_per_surviving_kb)) : 0;
-  const body = R.cost
-    ? `<div class="panel">${R.cost.map(c => `<div class="blocks"><span>${esc(c.model)}</span><div class="bl">${Array.from({ length: Math.max(1, Math.round(c.dollars_per_surviving_kb / most * 21)) }, () => '<i></i>').join('')}</div><span style="text-align:right">$${c.dollars_per_surviving_kb.toFixed(3)}</span></div>`).join('')}</div>`
+  const rows = (R.cost || []).filter(c => c.horizon === state.hz);
+  const most = rows.length ? Math.max(...rows.map(c => c.full_per_kb)) : 0;
+  const body = rows.length
+    ? `<div class="panel">${rows.map(c => `<div class="blocks"><span>${esc(c.model)}</span><div class="bl">${Array.from({ length: Math.max(1, Math.round(most ? c.full_per_kb / most * 21 : 1)) }, () => '<i></i>').join('')}</div><span style="text-align:right">direct $${c.direct_per_kb.toFixed(3)} · full $${c.full_per_kb.toFixed(3)}</span></div>`).join('')}</div>`
     : '<div class="card off">Not measured yet.</div>';
-  return head('06', 'COST PER SURVIVING KB', "Dollars spent on a model's calls for each kilobyte of its code that survived.") + body;
+  return head('06', 'COST PER RETAINED KB', `API-equivalent dollars per kilobyte of a model's code still there at ${state.hz}. Direct counts the prompts that wrote code; full counts the whole session.`) + body;
 }
 
 function s07() {

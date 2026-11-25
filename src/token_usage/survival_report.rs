@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use super::facts_db::{FactsDatabase, FileSurvival, LossShare, SliceDimension};
+use std::collections::HashSet;
+
+use super::cost::price_entry;
+use super::facts_db::{CostCall, FactsDatabase, FileSurvival, LossShare, SliceDimension};
 use super::survival::{Horizon, SurvivalAnchor};
+use super::types::{PricingShape, Speed, TokenCounts, UsageEntry};
 use crate::error::GitAiError;
 
 pub const EXAMPLE_MIN_BYTES: i64 = 1024;
@@ -94,7 +98,12 @@ pub struct ExampleGroup {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostRow {
     pub model: String,
-    pub dollars_per_surviving_kb: f64,
+    pub horizon: Horizon,
+    pub direct_usd: f64,
+    pub full_usd: f64,
+    pub surviving_bytes: i64,
+    pub direct_per_kb: f64,
+    pub full_per_kb: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,7 +234,7 @@ impl SurvivalReport {
             },
             slices,
             examples,
-            cost: None,
+            cost: cost_rows(db)?,
             quality: Quality {
                 spans: quality.spans,
                 pinned: quality.pinned,
@@ -264,6 +273,104 @@ fn ratio(surviving: i64, total: i64) -> f64 {
         return 0.0;
     }
     surviving as f64 / total as f64
+}
+
+fn cost_rows(db: &FactsDatabase) -> Result<Option<Vec<CostRow>>, GitAiError> {
+    let retained = db.retained_bytes_by_model()?;
+    if retained.is_empty() {
+        return Ok(None);
+    }
+    let priced: Vec<(CostCall, f64)> = db
+        .cost_calls()?
+        .into_iter()
+        .map(|call| {
+            let usd = call_usd(&call);
+            (call, usd)
+        })
+        .collect();
+    let owners = db.measured_span_owners()?;
+    let rows = retained
+        .into_iter()
+        .map(|retained| {
+            let at_age = owners
+                .iter()
+                .filter(|owner| owner.horizon == retained.horizon);
+            let prompts: HashSet<&str> = at_age
+                .clone()
+                .filter_map(|owner| owner.prompt_id.as_deref())
+                .collect();
+            let sessions: HashSet<&str> = at_age.map(|owner| owner.session_id.as_str()).collect();
+            let of_model = priced
+                .iter()
+                .filter(|(call, _)| call.model == retained.model);
+            let full_usd: f64 = of_model
+                .clone()
+                .filter(|(call, _)| {
+                    call.session_id
+                        .as_deref()
+                        .is_some_and(|session| sessions.contains(session))
+                })
+                .fold(0.0, |total, (_, usd)| total + usd);
+            let direct_usd: f64 = of_model
+                .filter(|(call, _)| {
+                    call.prompt_id
+                        .as_deref()
+                        .is_some_and(|prompt| prompts.contains(prompt))
+                })
+                .fold(0.0, |total, (_, usd)| total + usd);
+            CostRow {
+                direct_per_kb: per_kb(direct_usd, retained.surviving_bytes),
+                full_per_kb: per_kb(full_usd, retained.surviving_bytes),
+                model: retained.model,
+                horizon: retained.horizon,
+                direct_usd,
+                full_usd,
+                surviving_bytes: retained.surviving_bytes,
+            }
+        })
+        .collect();
+    Ok(Some(rows))
+}
+
+fn call_usd(call: &CostCall) -> f64 {
+    let speed: Option<Speed> = call
+        .speed
+        .as_deref()
+        .and_then(|speed| serde_json::from_value(serde_json::Value::from(speed)).ok());
+    let entry = UsageEntry {
+        entry_key: String::new(),
+        message_id: None,
+        ts: 0,
+        model: call.priced_model.clone(),
+        tokens: TokenCounts {
+            input: call.input_tokens,
+            output: call.output_tokens,
+            cache_read: call.cache_read_tokens,
+            cache_write: call.cache_write_tokens,
+            reasoning_output: None,
+            total: call
+                .input_tokens
+                .saturating_add(call.output_tokens)
+                .saturating_add(call.cache_read_tokens)
+                .saturating_add(call.cache_write_tokens),
+        },
+        cache_write_1h: call.cache_write_1h_tokens,
+        transcript_cost_micro_usd: None,
+        is_sidechain: false,
+        speed,
+        speed_inferred: speed.is_none(),
+        pricing_shape: PricingShape::Claude,
+    };
+    price_entry(&entry)
+        .cost_micro_usd
+        .map_or(0.0, |micro_usd| micro_usd as f64 / 1_000_000.0)
+}
+
+fn per_kb(usd: f64, bytes: i64) -> f64 {
+    if bytes == 0 {
+        return 0.0;
+    }
+    usd / (bytes as f64 / 1024.0)
 }
 
 fn loss_row(share: LossShare) -> LossRow {
@@ -400,6 +507,59 @@ mod tests {
     }
 
     #[test]
+    fn cost_rows_price_the_editing_prompt_as_direct_and_the_whole_session_as_full() {
+        let (_dir, db) = db();
+        let call = |request_id: &str, prompt_id: &str, tool_use_ids: Vec<String>| {
+            crate::token_usage::claude_facts::TranscriptFact::Call(Box::new(
+                crate::token_usage::claude_facts::CallFact {
+                    request_id: request_id.to_string(),
+                    session_id: Some("s1".to_string()),
+                    prompt_id: Some(prompt_id.to_string()),
+                    model: Some("claude-sonnet-4-20250514".to_string()),
+                    input_tokens: Some(1000),
+                    output_tokens: Some(500),
+                    cache_read_tokens: Some(20000),
+                    cache_write_tokens: Some(300),
+                    tool_use_ids,
+                    ..Default::default()
+                },
+            ))
+        };
+        db.commit_facts(&[
+            call("req-plan", "p0", Vec::new()),
+            call("req-edit", "p1", vec!["toolu_s1".to_string()]),
+        ])
+        .unwrap();
+        db.insert_span(&crate::token_usage::facts_db::NewSpan {
+            prompt_id: Some("p1".to_string()),
+            ..big_span("s1", "src/a.rs")
+        })
+        .unwrap();
+        db.pin_spans(
+            "/repo/.git",
+            "commit-1",
+            3000,
+            &std::collections::HashMap::from([("src/a.rs".to_string(), "blob-1".to_string())]),
+        )
+        .unwrap();
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        let report = SurvivalReport::build(&db).unwrap();
+
+        let rows = report.cost.expect("cost rows");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.model, "claude-sonnet-4-20250514");
+        assert_eq!(row.horizon, Horizon::Day);
+        assert_eq!(row.surviving_bytes, 2000);
+        assert!(row.direct_usd > 0.0);
+        assert!((row.full_usd - 2.0 * row.direct_usd).abs() < 1e-9);
+        let kb = 2000.0 / 1024.0;
+        assert!((row.direct_per_kb - row.direct_usd / kb).abs() < 1e-9);
+        assert!((row.full_per_kb - row.full_usd / kb).abs() < 1e-9);
+    }
+
+    #[test]
     fn groups_with_no_rows_are_left_out() {
         let (_dir, db) = measured_db();
 
@@ -468,7 +628,7 @@ mod tests {
         }
         assert!(demo.examples.iter().all(|group| !group.best.is_empty()));
         assert!(demo.examples.iter().all(|group| !group.worst.is_empty()));
-        assert_eq!(demo.cost.as_ref().map(Vec::len), Some(3));
+        assert_eq!(demo.cost.as_ref().map(Vec::len), Some(9));
         assert!(demo.quality.spans >= demo.quality.pinned);
     }
 

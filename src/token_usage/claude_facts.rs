@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::types::parse_rfc3339_secs;
+use crate::authorship::authorship_log_serialization::generate_session_id;
 
 const REQUEST_MARKER: &str = r#""requestId""#;
 const PROMPT_MARKER: &str = r#""promptId""#;
@@ -10,6 +11,7 @@ const TURN_MARKER: &str = r#""turn_duration""#;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CallFact {
     pub request_id: String,
+    pub session_id: Option<String>,
     pub message_id: Option<String>,
     pub uuid: Option<String>,
     pub parent_uuid: Option<String>,
@@ -98,6 +100,8 @@ impl ClaudeFactsParser {
         let usage = entry.pointer("/message/usage")?;
         Some(CallFact {
             request_id,
+            session_id: str_at(entry, "/sessionId")
+                .map(|session_id| generate_session_id(&session_id, "claude")),
             message_id: str_at(entry, "/message/id"),
             uuid: str_at(entry, "/uuid"),
             parent_uuid: str_at(entry, "/parentUuid"),
@@ -247,6 +251,19 @@ mod tests {
             Some(TranscriptFact::Call(call)) => *call,
             other => panic!("expected a call fact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_call_keeps_the_session_it_was_made_in() {
+        let mut parser = ClaudeFactsParser::default();
+        let line = assistant_line("req-1", json!([]), json!({"sessionId": "sess-1"}));
+
+        let call = only_call(parser.parse_line(&line));
+
+        assert_eq!(
+            call.session_id,
+            Some(generate_session_id("sess-1", "claude"))
+        );
     }
 
     #[test]

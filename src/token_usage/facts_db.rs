@@ -189,6 +189,16 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (7);
     "#,
+    r#"
+    ALTER TABLE call ADD COLUMN session_id TEXT;
+    CREATE INDEX idx_call_session ON call(session_id);
+
+    UPDATE call SET session_id = (
+        SELECT span.session_id FROM span WHERE span.prompt_id = call.prompt_id LIMIT 1)
+    WHERE call.prompt_id IS NOT NULL;
+
+    INSERT INTO schema_version (version) VALUES (8);
+    "#,
 ];
 
 const INSERT_TOUCH: &str = "INSERT INTO span_touch (
@@ -279,17 +289,18 @@ const LINK_PENDING_SPANS_SQL: &str = "
 
 const CALL_UPSERT_SQL: &str = "
     INSERT INTO call (
-        request_id, message_id, uuid, parent_uuid, prompt_id, model, advisor_model, effort,
+        request_id, session_id, message_id, uuid, parent_uuid, prompt_id, model, advisor_model, effort,
         turn_effort, speed, stop_reason, input_tokens, output_tokens, cache_read_tokens,
         cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, thinking_tokens,
         iterations_json, timestamp, thinking_ms
     ) VALUES (
-        :request_id, :message_id, :uuid, :parent_uuid, :prompt_id, :model, :advisor_model, :effort,
+        :request_id, :session_id, :message_id, :uuid, :parent_uuid, :prompt_id, :model, :advisor_model, :effort,
         :turn_effort, :speed, :stop_reason, :input_tokens, :output_tokens, :cache_read_tokens,
         :cache_write_tokens, :cache_write_5m_tokens, :cache_write_1h_tokens, :thinking_tokens,
         :iterations_json, :timestamp, :thinking_ms
     )
     ON CONFLICT(request_id) DO UPDATE SET
+        session_id = COALESCE(call.session_id, excluded.session_id),
         message_id = COALESCE(call.message_id, excluded.message_id),
         uuid = COALESCE(call.uuid, excluded.uuid),
         parent_uuid = COALESCE(call.parent_uuid, excluded.parent_uuid),
@@ -402,6 +413,34 @@ fn anchor_basis(anchor: SurvivalAnchor) -> AnchorBasis {
             losses: "",
         },
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostCall {
+    pub model: String,
+    pub priced_model: String,
+    pub prompt_id: Option<String>,
+    pub session_id: Option<String>,
+    pub speed: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanOwner {
+    pub horizon: Horizon,
+    pub prompt_id: Option<String>,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedBytes {
+    pub model: String,
+    pub horizon: Horizon,
+    pub surviving_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -744,6 +783,100 @@ impl FactsDatabase {
         })
     }
 
+    pub fn cost_calls(&self) -> Result<Vec<CostCall>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT call.model, call.model, call.prompt_id, call.session_id, call.speed,
+                    COALESCE(call.input_tokens, 0), COALESCE(call.output_tokens, 0),
+                    COALESCE(call.cache_read_tokens, 0), COALESCE(call.cache_write_tokens, 0),
+                    COALESCE(call.cache_write_1h_tokens, 0),
+                    call.request_id AS sort_request, 0 AS sort_kind, 0 AS sort_index
+             FROM call
+             WHERE call.model IS NOT NULL
+               AND call.session_id IN (SELECT session_id FROM span)
+             UNION ALL
+             SELECT call.model, advisor.model, call.prompt_id, call.session_id, NULL,
+                    advisor.input_tokens, advisor.output_tokens,
+                    advisor.cache_read_tokens, advisor.cache_write_tokens, 0,
+                    call.request_id, 1, advisor.advisor_index
+             FROM advisor_use advisor JOIN call ON call.request_id = advisor.request_id
+             WHERE call.model IS NOT NULL
+               AND call.session_id IN (SELECT session_id FROM span)
+             ORDER BY sort_request, sort_kind, sort_index",
+        )?;
+        let calls = stmt
+            .query_map([], |row| {
+                let count = |index: usize| -> rusqlite::Result<u64> {
+                    Ok(row.get::<_, i64>(index)?.max(0) as u64)
+                };
+                Ok(CostCall {
+                    model: row.get(0)?,
+                    priced_model: row.get(1)?,
+                    prompt_id: row.get(2)?,
+                    session_id: row.get(3)?,
+                    speed: row.get(4)?,
+                    input_tokens: count(5)?,
+                    output_tokens: count(6)?,
+                    cache_read_tokens: count(7)?,
+                    cache_write_tokens: count(8)?,
+                    cache_write_1h_tokens: count(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(calls)
+    }
+
+    pub fn measured_span_owners(&self) -> Result<Vec<SpanOwner>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT span.prompt_id, span.session_id
+             FROM survival_measurement m JOIN span ON span.span_id = m.span_id
+             WHERE m.anchor = 'commit' AND m.horizon = ?1 AND m.outcome = 'ok'
+             ORDER BY 1, 2",
+        )?;
+        let mut owners = Vec::new();
+        for horizon in Horizon::ALL {
+            let found = stmt
+                .query_map(params![horizon.as_str()], |row| {
+                    Ok(SpanOwner {
+                        horizon,
+                        prompt_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            owners.extend(found);
+        }
+        Ok(owners)
+    }
+
+    pub fn retained_bytes_by_model(&self) -> Result<Vec<RetainedBytes>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT call.model, SUM(m.surviving_bytes)
+             FROM survival_measurement m
+             JOIN span ON span.span_id = m.span_id
+             JOIN call ON call.request_id = span.request_id
+             WHERE m.anchor = 'commit' AND m.horizon = ?1 AND m.outcome = 'ok'
+               AND m.surviving_bytes IS NOT NULL AND call.model IS NOT NULL
+             GROUP BY 1 ORDER BY 1",
+        )?;
+        let mut retained = Vec::new();
+        for horizon in Horizon::ALL {
+            let found = stmt
+                .query_map(params![horizon.as_str()], |row| {
+                    Ok(RetainedBytes {
+                        model: row.get(0)?,
+                        horizon,
+                        surviving_bytes: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            retained.extend(found);
+        }
+        Ok(retained)
+    }
+
     pub fn loss(&self) -> Result<Loss, GitAiError> {
         let conn = self.lock();
         Ok(Loss {
@@ -926,6 +1059,7 @@ fn upsert_call(tx: &Transaction<'_>, call: &CallFact) -> Result<(), GitAiError> 
         CALL_UPSERT_SQL,
         named_params! {
             ":request_id": call.request_id,
+            ":session_id": call.session_id,
             ":message_id": call.message_id,
             ":uuid": call.uuid,
             ":parent_uuid": call.parent_uuid,
@@ -1055,12 +1189,13 @@ mod tests {
                         turn_effort, speed, stop_reason, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, cache_write_5m_tokens,
                         cache_write_1h_tokens, thinking_tokens, iterations_json, timestamp,
-                        thinking_ms
+                        thinking_ms, session_id
                  FROM call WHERE request_id = ?1",
                 params![request_id],
                 |row| {
                     Ok(CallFact {
                         request_id: request_id.to_string(),
+                        session_id: row.get(20)?,
                         message_id: row.get(0)?,
                         uuid: row.get(1)?,
                         parent_uuid: row.get(2)?,
@@ -1094,10 +1229,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript-facts-db");
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         drop(db);
         let db = FactsDatabase::open(&path).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
     }
 
     fn insert_span(db: &FactsDatabase, span_id: &str) -> rusqlite::Result<usize> {
@@ -1239,7 +1374,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         assert_eq!(read_call(&db, "req-1").model.as_deref(), Some("main-model"));
         assert_eq!(row_count(&db, "span"), 0);
         assert_eq!(row_count(&db, "span_piece"), 0);
@@ -1270,7 +1405,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         let stored: (Option<String>, Option<String>) = db
             .lock()
             .query_row(
@@ -1383,7 +1518,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         let live = db.live_spans("/repo/.git", "src/a.rs").unwrap();
         assert_eq!(live[0].file_hash, None);
     }
@@ -1834,6 +1969,7 @@ mod tests {
         let (_dir, db) = db();
         let fact = CallFact {
             request_id: "req-1".to_string(),
+            session_id: Some("sess-1".to_string()),
             message_id: Some("msg-1".to_string()),
             uuid: Some("a-1".to_string()),
             parent_uuid: Some("u-1".to_string()),
@@ -2171,7 +2307,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         assert_eq!(row_count(&db, "survival_measurement"), 1);
         let stored: (Option<String>, Option<String>, Option<i64>) = db
             .lock()
@@ -2467,7 +2603,7 @@ mod tests {
 
         let db = FactsDatabase::open(&path).unwrap();
 
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         assert_eq!(committed_bytes(&db, "span-1"), Some(15));
         assert_eq!(phases(&db, "span-1"), vec!["pre_commit", "post_commit"]);
         assert_eq!(measured(&db, "span-1", "commit"), vec![]);
@@ -2665,6 +2801,143 @@ mod tests {
             tool_use_ids: vec![tool_use_id.to_string()],
             ..Default::default()
         })
+    }
+
+    fn session_call(
+        request_id: &str,
+        session_id: &str,
+        prompt_id: &str,
+        input_tokens: u64,
+    ) -> CallFact {
+        CallFact {
+            request_id: request_id.to_string(),
+            session_id: Some(session_id.to_string()),
+            prompt_id: Some(prompt_id.to_string()),
+            model: Some("claude-x".to_string()),
+            input_tokens: Some(input_tokens),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cost_calls_cover_every_call_of_a_session_that_wrote_a_span_and_its_advisors() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("s1")).unwrap();
+        db.commit_facts(&[
+            call_of(session_call("req-plan", "s1", "p0", 10)),
+            call_of(CallFact {
+                advisor_uses: vec![crate::token_usage::claude_facts::AdvisorFact {
+                    index: 0,
+                    model: "advisor-y".to_string(),
+                    input_tokens: 7,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                }],
+                ..session_call("req-edit", "s1", "p1", 0)
+            }),
+            call_of(session_call("req-other", "s2", "p9", 3)),
+        ])
+        .unwrap();
+
+        let calls = db.cost_calls().unwrap();
+
+        let seen: Vec<(&str, &str, Option<&str>, u64)> = calls
+            .iter()
+            .map(|call| {
+                (
+                    call.model.as_str(),
+                    call.priced_model.as_str(),
+                    call.prompt_id.as_deref(),
+                    call.input_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("claude-x", "claude-x", Some("p1"), 0),
+                ("claude-x", "advisor-y", Some("p1"), 7),
+                ("claude-x", "claude-x", Some("p0"), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn measured_span_owners_list_the_prompt_and_session_behind_each_reached_age() {
+        let (_dir, db) = db();
+        pin_new_span(&db, new_span("s1"));
+        db.measure_due_spans(NOW).unwrap();
+
+        assert_eq!(
+            db.measured_span_owners().unwrap(),
+            vec![SpanOwner {
+                horizon: Horizon::Day,
+                prompt_id: Some("p1".to_string()),
+                session_id: "s1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn retained_bytes_add_up_commit_survivors_per_model_and_age() {
+        let (_dir, db) = db();
+        db.commit_facts(&[call_with_model("req-1", "toolu_1", Some("high"))])
+            .unwrap();
+        pin_new_span(&db, new_span("s1"));
+        pin_new_span(
+            &db,
+            NewSpan {
+                tool_use_id: None,
+                file_path: "src/b.rs".to_string(),
+                ..new_span("s2")
+            },
+        );
+        db.measure_due_spans(NOW).unwrap();
+
+        assert_eq!(
+            db.retained_bytes_by_model().unwrap(),
+            vec![RetainedBytes {
+                model: "claude-x".to_string(),
+                horizon: Horizon::Day,
+                surviving_bytes: 25,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_v7_database_backfills_call_sessions_from_spans_with_the_same_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript-facts-db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            for migration in &MIGRATIONS[..7] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO span (span_id, session_id, prompt_id, repo_key, file_path,
+                                   author_kind, author_id, source, content_hash, created_at)
+                 VALUES ('span-1', 's1', 'p1', '/repo/.git', 'src/a.rs', 'ai', 'author-1',
+                         'file_edit', 'hash-1', 1000);
+                 INSERT INTO call (request_id, prompt_id) VALUES ('req-1', 'p1'), ('req-2', 'p2');",
+            )
+            .unwrap();
+        }
+
+        let db = FactsDatabase::open(&path).unwrap();
+
+        assert_eq!(schema_version(&db), 8);
+        let session = |request_id: &str| -> Option<String> {
+            db.lock()
+                .query_row(
+                    "SELECT session_id FROM call WHERE request_id = ?1",
+                    params![request_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(session("req-1"), Some("s1".to_string()));
+        assert_eq!(session("req-2"), None);
     }
 
     #[test]

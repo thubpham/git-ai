@@ -2280,6 +2280,81 @@ fn survival_json(repo: &TestRepo, flags: &[&str]) -> serde_json::Value {
 }
 
 #[test]
+fn cost_per_retained_kb_counts_only_editing_prompts_as_direct_and_the_whole_session_as_full() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    let repo_root = repo.canonical_path();
+    let transcript_path = repo_root.join("claude-session.jsonl");
+    let in_session =
+        |line: String| line.replace(r#""sessionId":"ext""#, r#""sessionId":"sess-span""#);
+    let lines = [
+        json!({"type": "user", "promptId": "prompt-0", "sessionId": "sess-span"}).to_string(),
+        in_session(claude_call_line(
+            "a-0",
+            "req-0",
+            &recent_ts(1, 0),
+            json!([{"type": "text", "text": "plan"}]),
+            None,
+        )),
+        json!({"type": "user", "promptId": "prompt-1", "sessionId": "sess-span"}).to_string(),
+        in_session(claude_call_line(
+            "a-1",
+            "req-1",
+            &recent_ts(1, 1),
+            json!([{"type": "tool_use", "id": "toolu_edit_1"}]),
+            None,
+        )),
+    ];
+    fs::write(&transcript_path, format!("{}\n", lines.join("\n"))).unwrap();
+    let file_path = repo_root.join("example.ts");
+    fs::write(&file_path, "const x = 1;\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_1",
+        "prompt-1",
+        "const x = 1;\nconst y = 2;\n",
+    );
+    repo.stage_all_and_commit("add y").unwrap();
+    sync_token_usage_pipeline(&repo);
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+    git_ai::sqlite::open_with_memory_limits(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE span SET created_at = created_at - ?1, pinned_at = pinned_at - ?1",
+        [2 * 24 * 60 * 60],
+    )
+    .unwrap();
+
+    let report = survival_json(&repo, &[]);
+
+    let rows = report["cost"].as_array().expect("cost rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["model"], "claude-sonnet-4-20250514");
+    assert_eq!(row["horizon"], "24h");
+    assert_eq!(row["surviving_bytes"], 13);
+    let direct = row["direct_usd"].as_f64().unwrap();
+    let full = row["full_usd"].as_f64().unwrap();
+    assert!(direct > 0.0, "{row}");
+    assert!((full - 2.0 * direct).abs() < 1e-9, "{row}");
+    let kb = 13.0 / 1024.0;
+    assert!((row["direct_per_kb"].as_f64().unwrap() - direct / kb).abs() < 1e-9);
+    assert!((row["full_per_kb"].as_f64().unwrap() - full / kb).abs() < 1e-9);
+}
+
+#[test]
 fn the_survival_text_report_lists_the_matured_span_in_its_headline_table() {
     let repo = repo_with_a_matured_ai_line();
 

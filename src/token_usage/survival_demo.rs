@@ -178,6 +178,35 @@ fn example_groups() -> Vec<ExampleGroup> {
         .collect()
 }
 
+fn cost_rows() -> Vec<CostRow> {
+    let models = [
+        ("model-a", 0.042, 0.055),
+        ("model-b", 0.031, 0.044),
+        ("model-c", 0.018, 0.029),
+    ];
+    let ages = [
+        (Horizon::Day, 1.0, 512_000),
+        (Horizon::Week, 1.3, 394_000),
+        (Horizon::Month, 1.6, 320_000),
+    ];
+    ages.iter()
+        .flat_map(|&(horizon, scale, surviving_bytes)| {
+            models.iter().map(move |&(model, direct, full)| {
+                let kb = surviving_bytes as f64 / 1024.0;
+                CostRow {
+                    model: model.to_string(),
+                    horizon,
+                    direct_usd: direct * scale * kb,
+                    full_usd: full * scale * kb,
+                    surviving_bytes,
+                    direct_per_kb: direct * scale,
+                    full_per_kb: full * scale,
+                }
+            })
+        })
+        .collect()
+}
+
 fn loss(kind: &str, bytes: i64) -> LossRow {
     LossRow {
         kind: kind.to_string(),
@@ -211,20 +240,7 @@ impl SurvivalReport {
             },
             slices: slice_groups(),
             examples: example_groups(),
-            cost: Some(vec![
-                CostRow {
-                    model: "model-a".to_string(),
-                    dollars_per_surviving_kb: 0.042,
-                },
-                CostRow {
-                    model: "model-b".to_string(),
-                    dollars_per_surviving_kb: 0.031,
-                },
-                CostRow {
-                    model: "model-c".to_string(),
-                    dollars_per_surviving_kb: 0.018,
-                },
-            ]),
+            cost: Some(cost_rows()),
             quality: Quality {
                 spans: 1284,
                 pinned: 1102,

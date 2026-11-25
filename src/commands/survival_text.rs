@@ -1,6 +1,6 @@
 use crate::token_usage::facts_db::SliceDimension;
 use crate::token_usage::survival::{Horizon, SurvivalAnchor};
-use crate::token_usage::survival_report::{LossRow, SurvivalReport};
+use crate::token_usage::survival_report::{CostRow, LossRow, SurvivalReport};
 
 const BAR_WIDTH: usize = 20;
 const TOO_FEW_SPANS: i64 = 10;
@@ -142,7 +142,7 @@ pub fn render_text(report: &SurvivalReport, view: View, color: bool) -> String {
     loss(&mut out, report);
     slices(&mut out, report, view);
     examples(&mut out, report, view);
-    cost(&mut out, report);
+    cost(&mut out, report, view);
     quality(&mut out, report, view);
     let mut text = out.lines.join("\n");
     text.push('\n');
@@ -335,29 +335,39 @@ fn examples(out: &mut Writer, report: &SurvivalReport, view: View) {
     }
 }
 
-fn cost(out: &mut Writer, report: &SurvivalReport) {
-    out.heading("06 COST PER SURVIVING KB");
-    out.line("Dollars spent on a model's calls for each kilobyte of its code that survived.");
+fn cost(out: &mut Writer, report: &SurvivalReport, view: View) {
+    out.heading("06 COST PER RETAINED KB");
+    out.line(format!(
+        "API-equivalent dollars per kilobyte of a model's code still there at {}. Direct counts the prompts that wrote code; full counts the whole session.",
+        view.horizon.as_str()
+    ));
     out.blank();
-    let Some(rows) = &report.cost else {
+    let rows: Vec<&CostRow> = report
+        .cost
+        .iter()
+        .flatten()
+        .filter(|row| row.horizon == view.horizon)
+        .collect();
+    if rows.is_empty() {
         out.line("  Not measured yet.");
         return;
-    };
+    }
     let most = rows
         .iter()
-        .map(|row| row.dollars_per_surviving_kb)
+        .map(|row| row.full_per_kb)
         .fold(0.0_f64, f64::max);
     for row in rows {
         let fraction = if most > 0.0 {
-            row.dollars_per_surviving_kb / most
+            row.full_per_kb / most
         } else {
             0.0
         };
         out.line(format!(
-            "  {:<12} {} ${:.3}",
+            "  {:<12} {} direct ${:.3}   full ${:.3}",
             row.model,
             bar(fraction),
-            row.dollars_per_surviving_kb
+            row.direct_per_kb,
+            row.full_per_kb
         ));
     }
 }
@@ -610,7 +620,7 @@ mod tests {
             "03 WHY IT DIES",
             "04 SLICES",
             "05 BEST AND WORST FILES",
-            "06 COST PER SURVIVING KB",
+            "06 COST PER RETAINED KB",
             "07 WHAT THIS RESTS ON",
         ];
         let positions: Vec<usize> = headings
@@ -774,18 +784,30 @@ mod tests {
     }
 
     #[test]
-    fn cost_rows_show_dollars_per_surviving_kilobyte() {
+    fn cost_rows_show_direct_and_full_dollars_per_surviving_kilobyte_for_the_chosen_age() {
         let mut report = sample_report();
-        report.cost = Some(vec![CostRow {
+        let row = |horizon: Horizon, direct_per_kb: f64, full_per_kb: f64| CostRow {
             model: "model-a".to_string(),
-            dollars_per_surviving_kb: 0.042,
-        }]);
+            horizon,
+            direct_usd: 1.0,
+            full_usd: 1.2,
+            surviving_bytes: 1024,
+            direct_per_kb,
+            full_per_kb,
+        };
+        report.cost = Some(vec![
+            row(Horizon::Day, 0.042, 0.050),
+            row(Horizon::Week, 0.090, 0.110),
+        ]);
 
         let text = render_text(&report, day_view(), false);
 
         let cost = section(&text, "06");
         assert!(cost.contains("model-a"), "{cost}");
-        assert!(cost.contains("$0.042"), "{cost}");
+        assert!(cost.contains("direct $0.042"), "{cost}");
+        assert!(cost.contains("full $0.050"), "{cost}");
+        assert!(!cost.contains("$0.090"), "{cost}");
+        assert!(cost.contains("API-equivalent"), "{cost}");
         assert!(!cost.contains("Not measured yet"), "{cost}");
     }
 

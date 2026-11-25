@@ -76,12 +76,12 @@ Files whose AI code lasted longest and shortest at the chosen age. Files under 1
   worst  scripts/migrate.sh                          1.3 KB    7%
   worst  src/commands/git_ai_handlers.rs             6.8 KB   12%
 
-06 COST PER SURVIVING KB
-Dollars spent on a model's calls for each kilobyte of its code that survived.
+06 COST PER RETAINED KB
+API-equivalent dollars per kilobyte of a model's code still there at 30d. Direct counts the prompts that wrote code; full counts the whole session.
 
-  model-a      ████████████████████ $0.042
-  model-b      ███████████████░░░░░ $0.031
-  model-c      █████████░░░░░░░░░░░ $0.018
+  model-a      ████████████████████ direct $0.067   full $0.088
+  model-b      ████████████████░░░░ direct $0.050   full $0.070
+  model-c      ███████████░░░░░░░░░ direct $0.029   full $0.046
 
 07 WHAT THIS RESTS ON
 How many spans each number comes from, and what the data can't see.
