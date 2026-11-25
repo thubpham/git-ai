@@ -1,5 +1,6 @@
 {
     "cursorGitAi.enableCheckpointLogging": false,
     "cursor.composer.shouldChimeAfterChatFinishes": false,
-    "editor.accessibilitySupport": "off"
+    "editor.accessibilitySupport": "off",
+    "java.compile.nullAnalysis.mode": "automatic"
 }

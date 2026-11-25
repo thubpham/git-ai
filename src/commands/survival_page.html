@@ -97,7 +97,7 @@ const HZ = ['24h', '7d', '30d'];
 const DAYS = { '24h': 1, '7d': 7, '30d': 30 };
 const ANCHORS = [['commit', 'from commit', '#7fb8e8'], ['generation', 'from generation', '#f29bb5']];
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const state = { anchor: V.anchor, hz: V.horizon, show: { commit: true, generation: true } };
+const state = { anchor: V.anchor, hz: V.horizon };
 const LABELS = {
   relationship: { ai: 'AI code', known_human: 'human code', untracked: 'untracked text', none: 'fresh addition' },
   edit_type: { add: 'added', replace: 'replaced' },
@@ -142,34 +142,32 @@ function s01() {
 
 function xOf(days) { return 600 * days / 30; }
 function yOf(r) { return (1 - r) * 200; }
-function points(anchor) {
-  const rows = HZ.map(h => rowAt(anchor, h)).filter(Boolean);
-  return rows.length ? [[0, 1]].concat(rows.map(r => [xOf(DAYS[r.horizon]), r.retention])) : [];
-}
 function s02() {
-  const lines = ANCHORS.map(([a, , color]) => {
-    const pts = points(a);
-    if (!pts.length) return '';
-    const poly = pts.map(([x, r]) => `${x},${yOf(r)}`).join(' ');
-    const dots = pts.slice(1).map(([x, r]) => `<rect x="${x - 5}" y="${yOf(r) - 5}" width="10" height="10" fill="${color}" stroke="#4a3f55" stroke-width="2"/>`).join('');
-    return `<g id="line-${a}" style="opacity:${state.show[a] ? 1 : .08};transition:opacity .3s"><polyline class="line" points="${poly}" stroke="${color}" pathLength="1000"/>${dots}</g>`;
-  }).join('');
-  const any = ANCHORS.some(([a]) => points(a).length);
+  const S = R.stats;
+  const rows = S ? S.curve : [];
+  const line = pts => pts.map(([d, r]) => `${xOf(d)},${yOf(r)}`).join(' ');
+  const mid = [[0, 1]].concat(rows.map(c => [c.day, c.survival]));
+  const band = rows.length ? `<polygon points="${line([[0, 1]].concat(rows.map(c => [c.day, c.high])))} ${line(rows.map(c => [c.day, c.low]).reverse().concat([[0, 1]]))}" fill="#7fb8e8" opacity=".25"/>` : '';
+  const curve = rows.length ? `<polyline class="line" points="${line(mid)}" stroke="#7fb8e8" pathLength="1000"/>` : '';
+  const dots = rows.map(c => `<rect x="${xOf(c.day) - 5}" y="${yOf(c.survival) - 5}" width="10" height="10" fill="#7fb8e8" stroke="#4a3f55" stroke-width="2"/>`).join('');
   const grid = [0, 100, 200].map(y => `<line x1="0" y1="${y}" x2="600" y2="${y}" stroke="#e6d6ea" stroke-width="2"/>`).join('');
   const ylab = [['100%', 0], ['50%', 100], ['0%', 200]].map(([t, y]) => `<text x="-10" y="${y + 6}" text-anchor="end" fill="#7a6c85" font-size="16">${t}</text>`).join('');
-  const xlab = [['0', 0], ['24h', xOf(1)], ['7d', xOf(7)], ['30d', xOf(30)]].map(([t, x]) => `<text x="${x}" y="228" text-anchor="middle" fill="#7a6c85" font-size="16">${t}</text>`).join('');
-  const none = any ? '' : '<text x="300" y="100" text-anchor="middle" fill="#7a6c85" font-size="20">not yet</text>';
-  const toggles = ANCHORS.map(([a, name, color]) => `<button class="btn ${state.show[a] ? 'on' : ''}" data-line="${a}" style="border-color:#4a3f55"><span style="color:${color}">■</span> ${name}</button>`).join('');
-  return head('02', 'SURVIVAL CURVE', 'How the share of AI bytes still present changes as code ages. Blue starts the clock at commit; pink starts it when the code was written, and includes code never committed. Click a name to hide a line.')
-    + `<div class="panel"><svg viewBox="0 0 680 244"><g transform="translate(56,12)">${grid}${ylab}${xlab}${lines}${none}<g class="mark" id="mark" style="transform:translate(0,0);opacity:0"><rect x="-10" y="-10" width="20" height="20" fill="#ffeaa7" stroke="#4a3f55" stroke-width="3"/></g></g></svg><div class="seg" style="margin:8px 0 0">${toggles}</div></div>`;
+  const xlab = [['0', 0], ['1d', xOf(1)], ['7d', xOf(7)], ['14d', xOf(14)], ['30d', xOf(30)]].map(([t, x]) => `<text x="${x}" y="228" text-anchor="middle" fill="#7a6c85" font-size="16">${t}</text>`).join('');
+  const none = rows.length ? '' : '<text x="300" y="100" text-anchor="middle" fill="#7a6c85" font-size="20">not yet</text>';
+  const lifetimes = S ? S.rmst.map(r => `<p class="note">Average lifetime: ${r.days.toFixed(1)} of the first ${r.limit_days} days (${r.low.toFixed(1)}–${r.high.toFixed(1)}).</p>`).join('') : '';
+  const counts = S ? `<p class="note">${count(S.spans)} spans, ${count(S.deaths)} died, watched for up to ${Math.round(S.followed_days)} days.</p>` : '';
+  const desc = `Share of committed spans still alive at each age after their commit. A span dies when it has lost at least ${S ? pct(S.threshold) : '50%'} of its committed bytes. The shaded band is the 95% range from resampling sessions.`;
+  return head('02', 'SURVIVAL CURVE', desc)
+    + `<div class="panel"><svg viewBox="0 0 680 244"><g transform="translate(56,12)">${grid}${ylab}${xlab}${band}${curve}${dots}${none}<g class="mark" id="mark" style="transform:translate(0,0);opacity:0"><rect x="-10" y="-10" width="20" height="20" fill="#ffeaa7" stroke="#4a3f55" stroke-width="3"/></g></g></svg></div>`
+    + counts + lifetimes;
 }
 function moveMark() {
   const mark = document.getElementById('mark');
-  const r = rowAt(state.anchor, state.hz);
+  const r = R.stats && R.stats.curve.find(c => c.day === DAYS[state.hz]);
   if (!mark) return;
   if (!r) { mark.style.opacity = 0; return; }
   mark.style.opacity = 1;
-  mark.style.transform = `translate(${xOf(DAYS[state.hz])}px,${yOf(r.retention)}px)`;
+  mark.style.transform = `translate(${xOf(r.day)}px,${yOf(r.survival)}px)`;
 }
 
 function stack(rows, names) {
@@ -243,28 +241,21 @@ function renderChosen() {
   put('s01', s01());
   put('s04', s04());
   put('s05', s05());
+  put('s06', s06());
   put('s07', s07());
   moveMark();
   tween();
 }
 put('s02', s02());
 put('s03', s03());
-put('s06', s06());
 renderChosen();
 setTimeout(() => document.getElementById('app').classList.add('settled'), 1200);
 
 document.getElementById('app').addEventListener('click', e => {
-  const t = e.target.closest('[data-hz],[data-anchor],[data-line]');
+  const t = e.target.closest('[data-hz],[data-anchor]');
   if (!t) return;
   if (t.dataset.hz) { state.hz = t.dataset.hz; renderChosen(); }
   else if (t.dataset.anchor) { state.anchor = t.dataset.anchor; renderChosen(); }
-  else if (t.dataset.line) {
-    const a = t.dataset.line;
-    state.show[a] = !state.show[a];
-    const g = document.getElementById('line-' + a);
-    if (g) g.style.opacity = state.show[a] ? 1 : .08;
-    t.classList.toggle('on', state.show[a]);
-  }
 });
 </script>
 </body>

@@ -20,6 +20,7 @@ pub mod spans;
 pub mod survival;
 pub mod survival_demo;
 pub mod survival_report;
+pub mod survival_stats;
 pub mod types;
 
 pub use extractor::{UsageExtractor, extractor_for_tool};

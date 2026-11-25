@@ -210,29 +210,78 @@ fn headline(out: &mut Writer, report: &SurvivalReport) {
             row.retention * 100.0
         ));
     }
+    if report.weightings.is_empty() {
+        return;
+    }
+    out.blank();
+    out.line("  From commit, weighted three ways:");
+    out.line(format!(
+        "  {:<5} {:>9} {:>9} {:>11}",
+        "age", "by byte", "by span", "by session"
+    ));
+    for row in &report.weightings {
+        out.line(format!(
+            "  {:<5} {:>8.1}% {:>8.1}% {:>10.1}%",
+            row.horizon.as_str(),
+            row.per_byte * 100.0,
+            row.per_span * 100.0,
+            row.per_session * 100.0
+        ));
+    }
 }
 
 fn curve(out: &mut Writer, report: &SurvivalReport) {
     out.heading("02 SURVIVAL CURVE");
-    out.line(
-        "How the share of AI bytes still present changes as code ages. 'from commit' starts the clock at commit; 'from generation' starts it when the code was written, and includes code never committed.",
-    );
+    let Some(stats) = &report.stats else {
+        out.line("Share of committed spans still alive at each age after their commit.");
+        out.blank();
+        out.line("  not yet");
+        return;
+    };
+    out.line(format!(
+        "Share of committed spans still alive at each age after their commit. A span dies when it has lost at least {} of its committed bytes. Spans still alive count for as long as they have been watched. Ranges are 95%, from resampling sessions.",
+        percent(stats.threshold)
+    ));
     out.blank();
-    for anchor in SurvivalAnchor::ALL {
-        let points = report.curve(anchor);
-        if points.is_empty() {
-            out.line(format!("  {}   not yet", anchor_title(anchor)));
-            continue;
-        }
-        out.line(format!("  {}", anchor_title(anchor)));
-        for point in points {
-            out.line(format!(
-                "    {:<5} {} {:>4}",
-                point.label,
-                bar(point.retention),
-                percent(point.retention)
-            ));
-        }
+    out.line(format!(
+        "  {} spans, {} died, watched for up to {:.0} days",
+        format_count(stats.spans),
+        format_count(stats.deaths),
+        stats.followed_days
+    ));
+    for row in &stats.curve {
+        out.line(format!(
+            "    day {:<3} {} {:>4}  ({:.0}–{})",
+            row.day,
+            bar(row.survival),
+            percent(row.survival),
+            row.low * 100.0,
+            percent(row.high)
+        ));
+    }
+    for row in &stats.rmst {
+        out.line(format!(
+            "  Average lifetime: {:.1} of the first {} days  ({:.1}–{:.1})",
+            row.days, row.limit_days, row.low, row.high
+        ));
+    }
+    if stats.sensitivity.is_empty() {
+        return;
+    }
+    out.blank();
+    out.line("  Other death thresholds:");
+    for row in &stats.sensitivity {
+        let day_7 = row.survival_day_7.map_or_else(|| "–".to_string(), percent);
+        let rmst_14 = row
+            .rmst_14
+            .map_or_else(|| "–".to_string(), |days| format!("{days:.1} days"));
+        out.line(format!(
+            "    lost at least {:>4}   {:>6} died   alive at day 7 {:>4}   average over 14 days {}",
+            percent(row.threshold),
+            format_count(row.deaths),
+            day_7,
+            rmst_14
+        ));
     }
 }
 
@@ -409,8 +458,9 @@ mod tests {
     use super::*;
     use crate::token_usage::facts_db::SliceDimension;
     use crate::token_usage::survival_report::{
-        CommitRate, CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality,
-        SliceGroup, SliceRowOut, Totals,
+        CommitRate, CostRow, CurveRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow,
+        Quality, RmstRow, SensitivityRow, SliceGroup, SliceRowOut, SurvivalStats, Totals,
+        WeightingRow,
     };
 
     const ESC: &str = "\u{1b}[";
@@ -517,6 +567,8 @@ mod tests {
                 worst: vec![file_row("src/bad.rs", 100, 2000)],
             }],
             cost: None,
+            stats: None,
+            weightings: Vec::new(),
             quality: Quality {
                 spans: 1284,
                 pinned: 1102,
@@ -686,16 +738,75 @@ mod tests {
     }
 
     #[test]
-    fn the_curve_shows_each_anchor_from_full_retention() {
-        let text = render_text(&sample_report(), day_view(), false);
+    fn the_curve_shows_each_day_with_its_range_the_average_lifetime_and_other_thresholds() {
+        let mut report = sample_report();
+        report.stats = Some(SurvivalStats {
+            threshold: 0.5,
+            spans: 40,
+            deaths: 12,
+            followed_days: 31.0,
+            curve: vec![
+                CurveRow {
+                    day: 1,
+                    survival: 0.9,
+                    low: 0.8,
+                    high: 0.97,
+                },
+                CurveRow {
+                    day: 7,
+                    survival: 0.7,
+                    low: 0.55,
+                    high: 0.82,
+                },
+            ],
+            rmst: vec![RmstRow {
+                limit_days: 14,
+                days: 11.2,
+                low: 9.8,
+                high: 12.5,
+            }],
+            sensitivity: vec![SensitivityRow {
+                threshold: 0.25,
+                deaths: 20,
+                survival_day_7: Some(0.55),
+                rmst_14: Some(9.0),
+            }],
+        });
+
+        let text = render_text(&report, day_view(), false);
         let curve = section(&text, "02");
 
-        assert!(curve.contains("from commit"), "{curve}");
-        assert!(curve.contains("from generation"), "{curve}");
-        assert!(curve.contains("100%"), "{curve}");
+        assert!(curve.contains("lost at least 50%"), "{curve}");
+        assert!(curve.contains("40 spans, 12 died"), "{curve}");
+        assert!(curve.contains("day 1"), "{curve}");
         assert!(curve.contains("90%"), "{curve}");
-        assert!(curve.contains("60%"), "{curve}");
+        assert!(curve.contains("80–97%"), "{curve}");
+        assert!(curve.contains("11.2 of the first 14 days"), "{curve}");
+        assert!(curve.contains("9.8–12.5"), "{curve}");
+        assert!(curve.contains("25%"), "{curve}");
         assert!(curve.contains("█"), "{curve}");
+    }
+
+    #[test]
+    fn the_headline_shows_retention_by_byte_span_and_session() {
+        let mut report = sample_report();
+        report.weightings = vec![WeightingRow {
+            horizon: Horizon::Day,
+            spans: 14,
+            sessions: 5,
+            per_byte: 0.9,
+            per_span: 0.6,
+            per_session: 0.75,
+        }];
+
+        let text = render_text(&report, day_view(), false);
+        let headline = section(&text, "01");
+
+        assert!(headline.contains("by byte"), "{headline}");
+        assert!(headline.contains("by span"), "{headline}");
+        assert!(headline.contains("by session"), "{headline}");
+        assert!(headline.contains("60.0%"), "{headline}");
+        assert!(headline.contains("75.0%"), "{headline}");
     }
 
     #[test]

@@ -2355,6 +2355,53 @@ fn cost_per_retained_kb_counts_only_editing_prompts_as_direct_and_the_whole_sess
 }
 
 #[test]
+fn a_span_mostly_rewritten_after_its_commit_is_a_death_on_the_survival_curve() {
+    let (repo, transcript_path, file_path) = repo_with_one_ai_line();
+    repo.stage_all_and_commit("add y").unwrap();
+    let mut file = repo.filename("example.ts");
+    file.assert_committed_lines(lines![
+        "const x = 1;".unattributed_human(),
+        "const y = 2;".ai(),
+    ]);
+    claude_edit(
+        &repo,
+        "sess-span",
+        &transcript_path,
+        &file_path,
+        "toolu_edit_2",
+        "prompt-2",
+        "const x = 1;\nlet total = 42;\n",
+    );
+    sync_token_usage_pipeline(&repo);
+    let two_days = 2 * 24 * 60 * 60;
+    let writable = git_ai::sqlite::open_with_memory_limits(
+        repo.test_home_path()
+            .join(".git-ai/internal/transcript-facts-db"),
+    )
+    .unwrap();
+    writable
+        .execute(
+            "UPDATE span SET created_at = created_at - ?1, pinned_at = pinned_at - ?1",
+            [two_days],
+        )
+        .unwrap();
+    writable
+        .execute(
+            "UPDATE span_touch SET touched_at = touched_at - ?1",
+            [two_days],
+        )
+        .unwrap();
+
+    let report = survival_json(&repo, &[]);
+
+    let stats = &report["stats"];
+    assert_eq!(stats["spans"], 1, "{stats}");
+    assert_eq!(stats["deaths"], 1, "{stats}");
+    assert_eq!(stats["curve"][0]["day"], 1, "{stats}");
+    assert_eq!(stats["curve"][0]["survival"], 0.0, "{stats}");
+}
+
+#[test]
 fn the_survival_text_report_lists_the_matured_span_in_its_headline_table() {
     let repo = repo_with_a_matured_ai_line();
 

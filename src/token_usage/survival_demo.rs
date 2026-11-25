@@ -1,8 +1,9 @@
 use super::facts_db::SliceDimension;
 use super::survival::{Horizon, SurvivalAnchor};
 use super::survival_report::{
-    CommitRate, CostRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow, Quality,
-    SliceGroup, SliceRowOut, SurvivalReport, Totals,
+    CommitRate, CostRow, CurveRow, DEATH_THRESHOLD, ExampleGroup, FileRow, HorizonRow, LossReport,
+    LossRow, Quality, RmstRow, SensitivityRow, SliceGroup, SliceRowOut, SurvivalReport,
+    SurvivalStats, Totals, WeightingRow,
 };
 
 const AVERAGE_SPAN_BYTES: i64 = 6000;
@@ -178,6 +179,83 @@ fn example_groups() -> Vec<ExampleGroup> {
         .collect()
 }
 
+fn survival_stats() -> SurvivalStats {
+    let curve = |day: u32, survival: f64, low: f64, high: f64| CurveRow {
+        day,
+        survival,
+        low,
+        high,
+    };
+    let sensitivity = |threshold: f64, deaths: i64, day_7: f64, rmst_14: f64| SensitivityRow {
+        threshold,
+        deaths,
+        survival_day_7: Some(day_7),
+        rmst_14: Some(rmst_14),
+    };
+    SurvivalStats {
+        threshold: DEATH_THRESHOLD,
+        spans: 1102,
+        deaths: 318,
+        followed_days: 41.0,
+        curve: vec![
+            curve(1, 0.93, 0.90, 0.95),
+            curve(3, 0.86, 0.82, 0.89),
+            curve(7, 0.79, 0.74, 0.83),
+            curve(14, 0.72, 0.66, 0.77),
+            curve(30, 0.64, 0.57, 0.70),
+        ],
+        rmst: vec![
+            RmstRow {
+                limit_days: 14,
+                days: 11.4,
+                low: 10.8,
+                high: 11.9,
+            },
+            RmstRow {
+                limit_days: 30,
+                days: 21.6,
+                low: 20.1,
+                high: 23.0,
+            },
+        ],
+        sensitivity: vec![
+            sensitivity(0.25, 451, 0.70, 10.6),
+            sensitivity(0.5, 318, 0.79, 11.4),
+            sensitivity(0.75, 246, 0.84, 11.9),
+            sensitivity(1.0, 197, 0.88, 12.3),
+        ],
+    }
+}
+
+fn weighting_rows() -> Vec<WeightingRow> {
+    vec![
+        WeightingRow {
+            horizon: Horizon::Day,
+            spans: 1046,
+            sessions: 212,
+            per_byte: 0.91,
+            per_span: 0.86,
+            per_session: 0.88,
+        },
+        WeightingRow {
+            horizon: Horizon::Week,
+            spans: 812,
+            sessions: 171,
+            per_byte: 0.78,
+            per_span: 0.69,
+            per_session: 0.74,
+        },
+        WeightingRow {
+            horizon: Horizon::Month,
+            spans: 529,
+            sessions: 108,
+            per_byte: 0.66,
+            per_span: 0.55,
+            per_session: 0.61,
+        },
+    ]
+}
+
 fn cost_rows() -> Vec<CostRow> {
     let models = [
         ("model-a", 0.042, 0.055),
@@ -241,6 +319,8 @@ impl SurvivalReport {
             slices: slice_groups(),
             examples: example_groups(),
             cost: Some(cost_rows()),
+            stats: Some(survival_stats()),
+            weightings: weighting_rows(),
             quality: Quality {
                 spans: 1284,
                 pinned: 1102,

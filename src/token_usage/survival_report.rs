@@ -5,11 +5,20 @@ use std::collections::HashSet;
 use super::cost::price_entry;
 use super::facts_db::{CostCall, FactsDatabase, FileSurvival, LossShare, SliceDimension};
 use super::survival::{Horizon, SurvivalAnchor};
+use super::survival_stats::{
+    DAY_SECS, Lifetime, kaplan_meier, lifetime, rmst, session_bootstrap, survival_at,
+};
 use super::types::{PricingShape, Speed, TokenCounts, UsageEntry};
 use crate::error::GitAiError;
 
 pub const EXAMPLE_MIN_BYTES: i64 = 1024;
 pub const EXAMPLE_LIMIT: usize = 3;
+pub const DEATH_THRESHOLD: f64 = 0.5;
+const SENSITIVITY_THRESHOLDS: [f64; 4] = [0.25, 0.5, 0.75, 1.0];
+const CURVE_DAYS: [u32; 5] = [1, 3, 7, 14, 30];
+const RMST_DAYS: [u32; 2] = [14, 30];
+const BOOTSTRAP_RESAMPLES: usize = 1000;
+const BOOTSTRAP_SEED: u64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SurvivalReport {
@@ -21,6 +30,8 @@ pub struct SurvivalReport {
     pub slices: Vec<SliceGroup>,
     pub examples: Vec<ExampleGroup>,
     pub cost: Option<Vec<CostRow>>,
+    pub stats: Option<SurvivalStats>,
+    pub weightings: Vec<WeightingRow>,
     pub quality: Quality,
 }
 
@@ -116,10 +127,49 @@ pub struct Quality {
     pub none: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CurvePoint {
-    pub label: String,
-    pub retention: f64,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurvivalStats {
+    pub threshold: f64,
+    pub spans: i64,
+    pub deaths: i64,
+    pub followed_days: f64,
+    pub curve: Vec<CurveRow>,
+    pub rmst: Vec<RmstRow>,
+    pub sensitivity: Vec<SensitivityRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurveRow {
+    pub day: u32,
+    pub survival: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmstRow {
+    pub limit_days: u32,
+    pub days: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensitivityRow {
+    pub threshold: f64,
+    pub deaths: i64,
+    pub survival_day_7: Option<f64>,
+    pub rmst_14: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeightingRow {
+    pub horizon: Horizon,
+    pub spans: i64,
+    pub sessions: i64,
+    pub per_byte: f64,
+    pub per_span: f64,
+    pub per_session: f64,
 }
 
 impl SurvivalReport {
@@ -145,6 +195,8 @@ impl SurvivalReport {
             slices: Vec::new(),
             examples: Vec::new(),
             cost: None,
+            stats: None,
+            weightings: Vec::new(),
             quality: Quality {
                 spans: 0,
                 pinned: 0,
@@ -156,7 +208,7 @@ impl SurvivalReport {
         }
     }
 
-    pub fn build(db: &FactsDatabase) -> Result<SurvivalReport, GitAiError> {
+    pub fn build(db: &FactsDatabase, now: i64) -> Result<SurvivalReport, GitAiError> {
         let totals = db.span_totals()?;
         let commit_rate = db.commit_rate()?;
         let loss = db.loss()?;
@@ -235,6 +287,19 @@ impl SurvivalReport {
             slices,
             examples,
             cost: cost_rows(db)?,
+            stats: survival_stats(db, now)?,
+            weightings: db
+                .retention_weightings()?
+                .into_iter()
+                .map(|row| WeightingRow {
+                    horizon: row.horizon,
+                    spans: row.spans,
+                    sessions: row.sessions,
+                    per_byte: row.per_byte,
+                    per_span: row.per_span,
+                    per_session: row.per_session,
+                })
+                .collect(),
             quality: Quality {
                 spans: quality.spans,
                 pinned: quality.pinned,
@@ -245,27 +310,6 @@ impl SurvivalReport {
             },
         })
     }
-
-    pub fn curve(&self, anchor: SurvivalAnchor) -> Vec<CurvePoint> {
-        let reached: Vec<CurvePoint> = self
-            .horizons
-            .iter()
-            .filter(|row| row.anchor == anchor)
-            .map(|row| CurvePoint {
-                label: row.horizon.as_str().to_string(),
-                retention: row.retention,
-            })
-            .collect();
-        if reached.is_empty() {
-            return reached;
-        }
-        let mut curve = vec![CurvePoint {
-            label: "0".to_string(),
-            retention: 1.0,
-        }];
-        curve.extend(reached);
-        curve
-    }
 }
 
 fn ratio(surviving: i64, total: i64) -> f64 {
@@ -273,6 +317,79 @@ fn ratio(surviving: i64, total: i64) -> f64 {
         return 0.0;
     }
     surviving as f64 / total as f64
+}
+
+fn survival_stats(db: &FactsDatabase, now: i64) -> Result<Option<SurvivalStats>, GitAiError> {
+    let histories = db.committed_span_histories()?;
+    if histories.is_empty() {
+        return Ok(None);
+    }
+    let lifetimes_at = |threshold: f64| -> Vec<Lifetime> {
+        histories
+            .iter()
+            .map(|history| lifetime(history, threshold, now))
+            .collect()
+    };
+    let lifetimes = lifetimes_at(DEATH_THRESHOLD);
+    let followed_days = histories
+        .iter()
+        .map(|history| (now - history.pinned_at).max(0) as f64 / DAY_SECS)
+        .fold(0.0, f64::max);
+    let curve = kaplan_meier(&lifetimes);
+    let reached = |day: u32| f64::from(day) <= followed_days;
+    let range = |statistic: &dyn Fn(&[Lifetime]) -> f64| {
+        session_bootstrap(&lifetimes, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, statistic)
+    };
+    let curve_rows = CURVE_DAYS
+        .into_iter()
+        .filter(|&day| reached(day))
+        .map(|day| {
+            let at = f64::from(day);
+            let (low, high) = range(&|sample| survival_at(&kaplan_meier(sample), at));
+            CurveRow {
+                day,
+                survival: survival_at(&curve, at),
+                low,
+                high,
+            }
+        })
+        .collect();
+    let rmst_rows = RMST_DAYS
+        .into_iter()
+        .filter(|&day| reached(day))
+        .map(|limit_days| {
+            let limit = f64::from(limit_days);
+            let (low, high) = range(&|sample| rmst(&kaplan_meier(sample), limit));
+            RmstRow {
+                limit_days,
+                days: rmst(&curve, limit),
+                low,
+                high,
+            }
+        })
+        .collect();
+    let sensitivity = SENSITIVITY_THRESHOLDS
+        .into_iter()
+        .map(|threshold| {
+            let at_threshold = lifetimes_at(threshold);
+            let curve = kaplan_meier(&at_threshold);
+            SensitivityRow {
+                threshold,
+                deaths: at_threshold.iter().filter(|lifetime| lifetime.died).count() as i64,
+                survival_day_7: reached(7).then(|| survival_at(&curve, 7.0)),
+                rmst_14: reached(14).then(|| rmst(&curve, 14.0)),
+            }
+        })
+        .collect();
+    Ok(Some(SurvivalStats {
+        threshold: DEATH_THRESHOLD,
+        spans: lifetimes.len() as i64,
+        deaths: lifetimes.iter().filter(|lifetime| lifetime.died).count() as i64,
+        followed_days,
+        curve: curve_rows,
+        rmst: rmst_rows,
+        sensitivity,
+    }))
 }
 
 fn cost_rows(db: &FactsDatabase) -> Result<Option<Vec<CostRow>>, GitAiError> {
@@ -438,22 +555,11 @@ mod tests {
         (dir, db)
     }
 
-    fn horizon_row(anchor: SurvivalAnchor, horizon: Horizon, retention: f64) -> HorizonRow {
-        HorizonRow {
-            anchor,
-            horizon,
-            spans: 1,
-            surviving_bytes: 0,
-            total_bytes: 0,
-            retention,
-        }
-    }
-
     #[test]
     fn building_from_an_empty_database_gives_an_empty_report() {
         let (_dir, db) = db();
 
-        let report = SurvivalReport::build(&db).unwrap();
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
         assert_eq!(report, SurvivalReport::empty());
         assert!(!report.demo);
@@ -464,7 +570,7 @@ mod tests {
     fn building_collects_every_section_from_measured_spans() {
         let (_dir, db) = measured_db();
 
-        let report = SurvivalReport::build(&db).unwrap();
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
         assert!(!report.demo);
         assert_eq!(report.totals.spans, 2);
@@ -544,7 +650,7 @@ mod tests {
         .unwrap();
         db.measure_due_spans(3000 + 2 * DAY).unwrap();
 
-        let report = SurvivalReport::build(&db).unwrap();
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
         let rows = report.cost.expect("cost rows");
         assert_eq!(rows.len(), 1);
@@ -563,7 +669,7 @@ mod tests {
     fn groups_with_no_rows_are_left_out() {
         let (_dir, db) = measured_db();
 
-        let report = SurvivalReport::build(&db).unwrap();
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
         assert!(report.slices.iter().all(|group| !group.rows.is_empty()));
         assert!(
@@ -583,7 +689,7 @@ mod tests {
     #[test]
     fn a_built_report_survives_a_json_round_trip() {
         let (_dir, db) = measured_db();
-        let report = SurvivalReport::build(&db).unwrap();
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
         let json = serde_json::to_string(&report).unwrap();
         let parsed: SurvivalReport = serde_json::from_str(&json).unwrap();
@@ -647,40 +753,45 @@ mod tests {
     }
 
     #[test]
-    fn the_curve_starts_at_full_retention_and_follows_the_reached_horizons() {
-        let mut report = SurvivalReport::empty();
-        report.horizons = vec![
-            horizon_row(SurvivalAnchor::Commit, Horizon::Day, 0.8),
-            horizon_row(SurvivalAnchor::Commit, Horizon::Week, 0.6),
-            horizon_row(SurvivalAnchor::Generation, Horizon::Day, 0.7),
-        ];
+    fn building_adds_the_survival_curve_and_weightings_for_committed_spans() {
+        let (_dir, db) = measured_db();
 
-        let curve = report.curve(SurvivalAnchor::Commit);
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
 
+        let stats = report.stats.expect("stats");
+        assert_eq!((stats.spans, stats.deaths), (2, 0));
+        assert!((stats.threshold - 0.5).abs() < 1e-12);
+        assert!((stats.followed_days - 2.0).abs() < 1e-12);
         assert_eq!(
-            curve,
-            vec![
-                CurvePoint {
-                    label: "0".to_string(),
-                    retention: 1.0
-                },
-                CurvePoint {
-                    label: "24h".to_string(),
-                    retention: 0.8
-                },
-                CurvePoint {
-                    label: "7d".to_string(),
-                    retention: 0.6
-                },
-            ]
+            stats.curve,
+            vec![CurveRow {
+                day: 1,
+                survival: 1.0,
+                low: 1.0,
+                high: 1.0,
+            }]
         );
+        assert_eq!(stats.rmst, Vec::<RmstRow>::new());
+        assert_eq!(
+            stats
+                .sensitivity
+                .iter()
+                .map(|row| row.threshold)
+                .collect::<Vec<_>>(),
+            vec![0.25, 0.5, 0.75, 1.0]
+        );
+        assert_eq!(report.weightings.len(), 1);
+        assert!((report.weightings[0].per_span - 1.0).abs() < 1e-12);
+        assert!((report.weightings[0].per_session - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    fn a_curve_with_no_horizons_is_empty() {
-        assert_eq!(
-            SurvivalReport::empty().curve(SurvivalAnchor::Commit),
-            Vec::<CurvePoint>::new()
-        );
+    fn an_empty_database_has_no_survival_statistics() {
+        let (_dir, db) = db();
+
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
+
+        assert_eq!(report.stats, None);
+        assert!(report.weightings.is_empty());
     }
 }

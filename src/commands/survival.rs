@@ -127,14 +127,14 @@ fn load_report(options: &Options) -> Result<SurvivalReport, String> {
         .ok_or_else(|| "could not locate the git-ai internal directory".to_string())?
         .join("transcript-facts-db");
     let db = FactsDatabase::open(path).map_err(|e| e.to_string())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
     if options.measure {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs() as i64;
         db.measure_due_spans(now).map_err(|e| e.to_string())?;
     }
-    SurvivalReport::build(&db).map_err(|e| e.to_string())
+    SurvivalReport::build(&db, now).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

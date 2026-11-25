@@ -22,19 +22,29 @@ Of the bytes AI wrote, the share still in the code after 24 hours, 7 days and 30
   generation  7d       930    975,000  1,950,000      50.0%
   generation  30d      430    285,200    920,000      31.0%
 
-02 SURVIVAL CURVE
-How the share of AI bytes still present changes as code ages. 'from commit' starts the clock at commit; 'from generation' starts it when the code was written, and includes code never committed.
+  From commit, weighted three ways:
+  age     by byte   by span  by session
+  24h       91.0%     86.0%       88.0%
+  7d        78.0%     69.0%       74.0%
+  30d       66.0%     55.0%       61.0%
 
-  from commit
-    0     ████████████████████ 100%
-    24h   ████████████████░░░░  82%
-    7d    ████████████░░░░░░░░  61%
-    30d   █████████░░░░░░░░░░░  44%
-  from generation
-    0     ████████████████████ 100%
-    24h   ███████████████░░░░░  74%
-    7d    ██████████░░░░░░░░░░  50%
-    30d   ██████░░░░░░░░░░░░░░  31%
+02 SURVIVAL CURVE
+Share of committed spans still alive at each age after their commit. A span dies when it has lost at least 50% of its committed bytes. Spans still alive count for as long as they have been watched. Ranges are 95%, from resampling sessions.
+
+  1,102 spans, 318 died, watched for up to 41 days
+    day 1   ███████████████████░  93%  (90–95%)
+    day 3   █████████████████░░░  86%  (82–89%)
+    day 7   ████████████████░░░░  79%  (74–83%)
+    day 14  ██████████████░░░░░░  72%  (66–77%)
+    day 30  █████████████░░░░░░░  64%  (57–70%)
+  Average lifetime: 11.4 of the first 14 days  (10.8–11.9)
+  Average lifetime: 21.6 of the first 30 days  (20.1–23.0)
+
+  Other death thresholds:
+    lost at least  25%      451 died   alive at day 7  70%   average over 14 days 10.6 days
+    lost at least  50%      318 died   alive at day 7  79%   average over 14 days 11.4 days
+    lost at least  75%      246 died   alive at day 7  84%   average over 14 days 11.9 days
+    lost at least 100%      197 died   alive at day 7  88%   average over 14 days 12.3 days
 
 03 WHY IT DIES
 Of the bytes that disappeared, who removed them and how. Human edits only show up when the editor extension is running.

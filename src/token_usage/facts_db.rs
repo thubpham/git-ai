@@ -416,6 +416,24 @@ fn anchor_basis(anchor: SurvivalAnchor) -> AnchorBasis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanHistory {
+    pub session_id: String,
+    pub pinned_at: i64,
+    pub committed_bytes: i64,
+    pub losses: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionWeighting {
+    pub horizon: Horizon,
+    pub spans: i64,
+    pub sessions: i64,
+    pub per_byte: f64,
+    pub per_span: f64,
+    pub per_session: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostCall {
     pub model: String,
     pub priced_model: String,
@@ -781,6 +799,99 @@ impl FactsDatabase {
             bytes_written,
             bytes_committed,
         })
+    }
+
+    pub fn committed_span_histories(&self) -> Result<Vec<SpanHistory>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT span.span_id, span.session_id, span.pinned_at, span.committed_bytes,
+                    touch.touched_at, touch.bytes_removed
+             FROM span
+             LEFT JOIN span_touch touch
+               ON touch.span_id = span.span_id AND touch.phase = 'post_commit'
+             WHERE span.pinned_at IS NOT NULL AND span.committed_bytes > 0
+             ORDER BY span.span_id, touch.touched_at, touch.touch_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let mut histories: Vec<(String, SpanHistory)> = Vec::new();
+        for row in rows {
+            let (span_id, session_id, pinned_at, committed_bytes, touched_at, bytes_removed) = row?;
+            if histories.last().is_none_or(|(last, _)| *last != span_id) {
+                histories.push((
+                    span_id,
+                    SpanHistory {
+                        session_id,
+                        pinned_at,
+                        committed_bytes,
+                        losses: Vec::new(),
+                    },
+                ));
+            }
+            if let (Some(touched_at), Some(bytes_removed)) = (touched_at, bytes_removed)
+                && let Some((_, history)) = histories.last_mut()
+            {
+                history.losses.push((touched_at, bytes_removed));
+            }
+        }
+        Ok(histories.into_iter().map(|(_, history)| history).collect())
+    }
+
+    pub fn retention_weightings(&self) -> Result<Vec<RetentionWeighting>, GitAiError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "WITH measured AS (
+                 SELECT span.session_id, m.surviving_bytes, m.total_bytes
+                 FROM survival_measurement m JOIN span ON span.span_id = m.span_id
+                 WHERE m.anchor = 'commit' AND m.horizon = ?1 AND m.outcome = 'ok'
+                   AND m.surviving_bytes IS NOT NULL AND m.total_bytes > 0
+             )
+             SELECT COUNT(*), COUNT(DISTINCT session_id),
+                    CAST(SUM(surviving_bytes) AS REAL) / SUM(total_bytes),
+                    AVG(CAST(surviving_bytes AS REAL) / total_bytes),
+                    (SELECT AVG(ratio) FROM (
+                        SELECT CAST(SUM(surviving_bytes) AS REAL) / SUM(total_bytes) AS ratio
+                        FROM measured GROUP BY session_id))
+             FROM measured",
+        )?;
+        let mut rows = Vec::new();
+        for horizon in Horizon::ALL {
+            let (spans, sessions, per_byte, per_span, per_session): (
+                i64,
+                i64,
+                Option<f64>,
+                Option<f64>,
+                Option<f64>,
+            ) = stmt.query_row(params![horizon.as_str()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            if spans == 0 {
+                continue;
+            }
+            rows.push(RetentionWeighting {
+                horizon,
+                spans,
+                sessions,
+                per_byte: per_byte.unwrap_or(0.0),
+                per_span: per_span.unwrap_or(0.0),
+                per_session: per_session.unwrap_or(0.0),
+            });
+        }
+        Ok(rows)
     }
 
     pub fn cost_calls(&self) -> Result<Vec<CostCall>, GitAiError> {
@@ -2938,6 +3049,73 @@ mod tests {
         };
         assert_eq!(session("req-1"), Some("s1".to_string()));
         assert_eq!(session("req-2"), None);
+    }
+
+    #[test]
+    fn span_histories_list_committed_spans_with_only_their_post_commit_losses() {
+        let (_dir, db) = db();
+        db.insert_span(&new_span("span-kept")).unwrap();
+        db.insert_span(&NewSpan {
+            file_path: "src/dead.rs".to_string(),
+            ..new_span("span-dead-before-commit")
+        })
+        .unwrap();
+        remap_with_loss(&db, "span-kept", vec![(0, 10), (40, 50)], 1100, 5);
+        remap_with_loss(&db, "span-dead-before-commit", vec![], 1100, 25);
+        db.pin_spans("/repo/.git", "commit-1", 1200, &blobs("src/a.rs", "blob-1"))
+            .unwrap();
+        db.pin_spans(
+            "/repo/.git",
+            "commit-1",
+            1200,
+            &blobs("src/dead.rs", "blob-2"),
+        )
+        .unwrap();
+        remap_with_loss(&db, "span-kept", vec![(0, 10)], 1300, 10);
+        db.insert_span(&NewSpan {
+            file_path: "src/later.rs".to_string(),
+            ..new_span("span-unpinned")
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.committed_span_histories().unwrap(),
+            vec![SpanHistory {
+                session_id: "s1".to_string(),
+                pinned_at: 1200,
+                committed_bytes: 20,
+                losses: vec![(1300, 10)],
+            }]
+        );
+    }
+
+    #[test]
+    fn retention_weightings_count_bytes_spans_and_sessions_separately() {
+        let (_dir, db) = db();
+        for (span_id, session_id, file_path, length) in [
+            ("span-big", "s1", "src/big.rs", 1000),
+            ("span-small", "s2", "src/small.rs", 10),
+        ] {
+            db.insert_span(&NewSpan {
+                session_id: session_id.to_string(),
+                ..file_span("/repo/.git", span_id, file_path, length)
+            })
+            .unwrap();
+            db.pin_spans("/repo/.git", "commit-1", 3000, &blobs(file_path, "blob-1"))
+                .unwrap();
+        }
+        add_touch(&db, "span-small", 3100, 10);
+        db.measure_due_spans(3000 + 2 * DAY).unwrap();
+
+        let rows = db.retention_weightings().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.horizon, Horizon::Day);
+        assert_eq!((row.spans, row.sessions), (2, 2));
+        assert!((row.per_byte - 1000.0 / 1010.0).abs() < 1e-9);
+        assert!((row.per_span - 0.5).abs() < 1e-9);
+        assert!((row.per_session - 0.5).abs() < 1e-9);
     }
 
     #[test]
