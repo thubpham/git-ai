@@ -1,0 +1,59 @@
+src/token_usage/facts_db.rs
+  s_41aa9ecb187792::t_8420ee7851429a 3060,3062-3063
+  s_41aa9ecb187792::t_97c36bc77473e8 3092
+  s_41aa9ecb187792::t_294fa327213b10 808-809,811,821,823,825,830-831,837
+  s_41aa9ecb187792::t_c191c0454ea2a1 421
+tests/integration/token_usage.rs
+  s_41aa9ecb187792::t_d1c48123783bab 2402-2414
+src/token_usage/survival_report.rs
+  s_41aa9ecb187792::t_e603373bbdbbd6 3
+  s_41aa9ecb187792::t_a3b06a225be53f 235
+  s_41aa9ecb187792::t_913323184fdee9 312-313
+  s_41aa9ecb187792::t_5436384057d7bb 11
+  s_41aa9ecb187792::t_a9d2ff073412a0 345-408,410,419,425
+  s_41aa9ecb187792::t_1edc1d47fee0ec 453,461
+  s_41aa9ecb187792::t_bb3baa80a68547 220
+  s_41aa9ecb187792::t_e4cfda624e46ac 858-883
+  s_41aa9ecb187792::t_2637862752b90c 892
+  s_41aa9ecb187792::t_4a3aecedf60861 6-8
+  s_41aa9ecb187792::t_29b7d4576b4bf3 168-184
+  s_41aa9ecb187792::t_02ec5f1a9f130c 37
+  s_41aa9ecb187792::t_eab853e8a8b107 857
+src/token_usage/survival_stats.rs
+  s_41aa9ecb187792::t_030ef96c9060c8 35-41
+  s_41aa9ecb187792::t_b97dc0cc71f962 138,145-150
+  s_41aa9ecb187792::t_fb89c639eb28b6 151-152
+src/commands/survival_text.rs
+  s_41aa9ecb187792::t_0ef5f4f341bcec 3-5
+  s_41aa9ecb187792::t_c8a9c54c6bdf10 505-506
+  s_41aa9ecb187792::t_3b70fe5c99f26d 835-881
+  s_41aa9ecb187792::t_35491fbfe6414c 270-310
+  s_41aa9ecb187792::t_80655847293ba1 615
+  s_41aa9ecb187792::t_676e2f261067e1 504
+  s_41aa9ecb187792::t_187489abc2f8c5 833-834
+src/commands/survival_page.html
+  s_41aa9ecb187792::t_7661130652b051 159-166
+  s_41aa9ecb187792::t_75f7f15f28b409 170
+src/token_usage/survival_demo.rs
+  s_41aa9ecb187792::t_c8a9c54c6bdf10 4-6
+  s_41aa9ecb187792::t_bef5384d327927 230-295
+  s_41aa9ecb187792::t_9e73439a3eb681 390
+src/commands/snapshots/git_ai__commands__survival_text__tests__the_demo_report_reads_well_as_text.snap
+  s_41aa9ecb187792::t_316aa72acd32f1 43-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "d2ee5c4e002cf263e2ea3c57e5dc1324fcd44c49",
+  "prompts": {},
+  "sessions": {
+    "s_41aa9ecb187792": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0eca7968-588b-467e-9947-df34a4f2567b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Bao Thu Pham <thubpham@sas.upenn.edu>"
+    }
+  }
+}
