@@ -32,6 +32,13 @@ pub fn lifetime(history: &SpanHistory, threshold: f64, now: i64) -> Lifetime {
     }
 }
 
+pub fn commit_week(pinned_at: i64) -> String {
+    let day = pinned_at.div_euclid(DAY_SECS as i64);
+    let monday = day - (day + 3).rem_euclid(7);
+    chrono::DateTime::from_timestamp(monday * DAY_SECS as i64, 0)
+        .map_or_else(String::new, |date| date.format("%Y-%m-%d").to_string())
+}
+
 pub fn kaplan_meier(lifetimes: &[Lifetime]) -> Vec<(f64, f64)> {
     let mut death_times: Vec<f64> = lifetimes
         .iter()
@@ -128,10 +135,19 @@ mod tests {
     fn history(losses: Vec<(i64, i64)>) -> SpanHistory {
         SpanHistory {
             session_id: "s1".to_string(),
+            model: None,
             pinned_at: 1000,
             committed_bytes: 100,
             losses,
         }
+    }
+
+    #[test]
+    fn a_commit_week_is_named_by_its_monday_in_utc() {
+        assert_eq!(commit_week(1_795_392_000), "2026-11-23");
+        assert_eq!(commit_week(1_795_608_000), "2026-11-23");
+        assert_eq!(commit_week(1_795_996_799), "2026-11-23");
+        assert_eq!(commit_week(1_795_996_800), "2026-11-30");
     }
 
     const DAY: i64 = 86_400;

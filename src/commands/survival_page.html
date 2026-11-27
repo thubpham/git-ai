@@ -156,10 +156,18 @@ function s02() {
   const none = rows.length ? '' : '<text x="300" y="100" text-anchor="middle" fill="#7a6c85" font-size="20">not yet</text>';
   const lifetimes = S ? S.rmst.map(r => `<p class="note">Average lifetime: ${r.days.toFixed(1)} of the first ${r.limit_days} days (${r.low.toFixed(1)}–${r.high.toFixed(1)}).</p>`).join('') : '';
   const counts = S ? `<p class="note">${count(S.spans)} spans, ${count(S.deaths)} died, watched for up to ${Math.round(S.followed_days)} days.</p>` : '';
+  const at = (s, day) => { const c = s.curve.find(r => r.day === day); return c ? pct(c.survival) : '–'; };
+  const table = (dim, title) => {
+    const rows = (R.curve_slices || []).filter(s => s.dimension === dim);
+    if (!rows.length) return '';
+    const cells = rows.map(s => `<tr class="${s.spans < TOO_FEW ? 'few' : ''}"><td>${esc(s.label)}</td><td>${count(s.spans)}</td><td>${count(s.deaths)}</td><td>${at(s, 1)}</td><td>${at(s, 7)}</td><td>${at(s, 30)}</td><td>${s.spans < TOO_FEW ? 'too few' : ''}</td></tr>`).join('');
+    return `<div class="panel"><table style="width:100%;border-collapse:collapse;text-align:right"><tr><th style="text-align:left">${title}</th><th>spans</th><th>died</th><th>day 1</th><th>day 7</th><th>day 30</th><th></th></tr>${cells}</table></div>`;
+  };
+  const slices = table('model', 'By model') + table('commit_week', 'By commit week');
   const desc = `Share of committed spans still alive at each age after their commit. A span dies when it has lost at least ${S ? pct(S.threshold) : '50%'} of its committed bytes. The shaded band is the 95% range from resampling sessions.`;
   return head('02', 'SURVIVAL CURVE', desc)
     + `<div class="panel"><svg viewBox="0 0 680 244"><g transform="translate(56,12)">${grid}${ylab}${xlab}${band}${curve}${dots}${none}<g class="mark" id="mark" style="transform:translate(0,0);opacity:0"><rect x="-10" y="-10" width="20" height="20" fill="#ffeaa7" stroke="#4a3f55" stroke-width="3"/></g></g></svg></div>`
-    + counts + lifetimes;
+    + counts + lifetimes + slices;
 }
 function moveMark() {
   const mark = document.getElementById('mark');

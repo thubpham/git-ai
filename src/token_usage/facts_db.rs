@@ -418,6 +418,7 @@ fn anchor_basis(anchor: SurvivalAnchor) -> AnchorBasis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanHistory {
     pub session_id: String,
+    pub model: Option<String>,
     pub pinned_at: i64,
     pub committed_bytes: i64,
     pub losses: Vec<(i64, i64)>,
@@ -804,9 +805,10 @@ impl FactsDatabase {
     pub fn committed_span_histories(&self) -> Result<Vec<SpanHistory>, GitAiError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT span.span_id, span.session_id, span.pinned_at, span.committed_bytes,
-                    touch.touched_at, touch.bytes_removed
+            "SELECT span.span_id, span.session_id, call.model, span.pinned_at,
+                    span.committed_bytes, touch.touched_at, touch.bytes_removed
              FROM span
+             LEFT JOIN call ON call.request_id = span.request_id
              LEFT JOIN span_touch touch
                ON touch.span_id = span.span_id AND touch.phase = 'post_commit'
              WHERE span.pinned_at IS NOT NULL AND span.committed_bytes > 0
@@ -816,20 +818,23 @@ impl FactsDatabase {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
         let mut histories: Vec<(String, SpanHistory)> = Vec::new();
         for row in rows {
-            let (span_id, session_id, pinned_at, committed_bytes, touched_at, bytes_removed) = row?;
+            let (span_id, session_id, model, pinned_at, committed_bytes, touched_at, bytes_removed) =
+                row?;
             if histories.last().is_none_or(|(last, _)| *last != span_id) {
                 histories.push((
                     span_id,
                     SpanHistory {
                         session_id,
+                        model,
                         pinned_at,
                         committed_bytes,
                         losses: Vec::new(),
@@ -3052,8 +3057,10 @@ mod tests {
     }
 
     #[test]
-    fn span_histories_list_committed_spans_with_only_their_post_commit_losses() {
+    fn span_histories_list_committed_spans_with_their_model_and_only_post_commit_losses() {
         let (_dir, db) = db();
+        db.commit_facts(&[call_with_model("req-1", "toolu_1", Some("high"))])
+            .unwrap();
         db.insert_span(&new_span("span-kept")).unwrap();
         db.insert_span(&NewSpan {
             file_path: "src/dead.rs".to_string(),
@@ -3082,6 +3089,7 @@ mod tests {
             db.committed_span_histories().unwrap(),
             vec![SpanHistory {
                 session_id: "s1".to_string(),
+                model: Some("claude-x".to_string()),
                 pinned_at: 1200,
                 committed_bytes: 20,
                 losses: vec![(1300, 10)],

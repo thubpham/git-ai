@@ -1,6 +1,8 @@
 use crate::token_usage::facts_db::SliceDimension;
 use crate::token_usage::survival::{Horizon, SurvivalAnchor};
-use crate::token_usage::survival_report::{CostRow, LossRow, SurvivalReport};
+use crate::token_usage::survival_report::{
+    CostRow, CurveDimension, CurveSlice, LossRow, SurvivalReport,
+};
 
 const BAR_WIDTH: usize = 20;
 const TOO_FEW_SPANS: i64 = 10;
@@ -265,6 +267,47 @@ fn curve(out: &mut Writer, report: &SurvivalReport) {
             row.days, row.limit_days, row.low, row.high
         ));
     }
+    for (dimension, title) in [
+        (CurveDimension::Model, "By model"),
+        (CurveDimension::CommitWeek, "By commit week"),
+    ] {
+        let slices: Vec<&CurveSlice> = report
+            .curve_slices
+            .iter()
+            .filter(|slice| slice.dimension == dimension)
+            .collect();
+        if slices.is_empty() {
+            continue;
+        }
+        out.blank();
+        out.line(format!(
+            "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6}",
+            title, "spans", "died", "day 1", "day 7", "day 30"
+        ));
+        for slice in slices {
+            let at = |day: u32| {
+                slice
+                    .curve
+                    .iter()
+                    .find(|row| row.day == day)
+                    .map_or_else(|| "–".to_string(), |row| percent(row.survival))
+            };
+            let few = if slice.spans < TOO_FEW_SPANS {
+                "  too few"
+            } else {
+                ""
+            };
+            out.line(format!(
+                "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6}{few}",
+                slice.label,
+                format_count(slice.spans),
+                format_count(slice.deaths),
+                at(1),
+                at(7),
+                at(30)
+            ));
+        }
+    }
     if stats.sensitivity.is_empty() {
         return;
     }
@@ -458,9 +501,9 @@ mod tests {
     use super::*;
     use crate::token_usage::facts_db::SliceDimension;
     use crate::token_usage::survival_report::{
-        CommitRate, CostRow, CurveRow, ExampleGroup, FileRow, HorizonRow, LossReport, LossRow,
-        Quality, RmstRow, SensitivityRow, SliceGroup, SliceRowOut, SurvivalStats, Totals,
-        WeightingRow,
+        CommitRate, CostRow, CurveDimension, CurveRow, CurveSlice, ExampleGroup, FileRow,
+        HorizonRow, LossReport, LossRow, Quality, RmstRow, SensitivityRow, SliceGroup, SliceRowOut,
+        SurvivalStats, Totals, WeightingRow,
     };
 
     const ESC: &str = "\u{1b}[";
@@ -569,6 +612,7 @@ mod tests {
             cost: None,
             stats: None,
             weightings: Vec::new(),
+            curve_slices: Vec::new(),
             quality: Quality {
                 spans: 1284,
                 pinned: 1102,
@@ -785,6 +829,55 @@ mod tests {
         assert!(curve.contains("9.8–12.5"), "{curve}");
         assert!(curve.contains("25%"), "{curve}");
         assert!(curve.contains("█"), "{curve}");
+    }
+
+    #[test]
+    fn the_curve_lists_each_model_and_commit_week_at_the_days_watched() {
+        let mut report = sample_report();
+        let row = |day: u32, survival: f64| CurveRow {
+            day,
+            survival,
+            low: survival,
+            high: survival,
+        };
+        report.stats = Some(SurvivalStats {
+            threshold: 0.5,
+            spans: 43,
+            deaths: 11,
+            followed_days: 10.0,
+            curve: vec![row(1, 0.9)],
+            rmst: Vec::new(),
+            sensitivity: Vec::new(),
+        });
+        report.curve_slices = vec![
+            CurveSlice {
+                dimension: CurveDimension::Model,
+                label: "model-a".to_string(),
+                spans: 40,
+                deaths: 10,
+                followed_days: 10.0,
+                curve: vec![row(1, 0.9), row(7, 0.7)],
+            },
+            CurveSlice {
+                dimension: CurveDimension::CommitWeek,
+                label: "2026-11-23".to_string(),
+                spans: 3,
+                deaths: 1,
+                followed_days: 2.0,
+                curve: vec![row(1, 0.67)],
+            },
+        ];
+
+        let text = render_text(&report, day_view(), false);
+        let curve = section(&text, "02");
+
+        assert!(curve.contains("By model"), "{curve}");
+        assert!(curve.contains("model-a"), "{curve}");
+        assert!(curve.contains("70%"), "{curve}");
+        assert!(curve.contains("By commit week"), "{curve}");
+        assert!(curve.contains("2026-11-23"), "{curve}");
+        assert!(curve.contains("67%"), "{curve}");
+        assert!(curve.contains("too few"), "{curve}");
     }
 
     #[test]

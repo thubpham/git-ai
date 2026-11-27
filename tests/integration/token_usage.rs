@@ -2399,6 +2399,19 @@ fn a_span_mostly_rewritten_after_its_commit_is_a_death_on_the_survival_curve() {
     assert_eq!(stats["deaths"], 1, "{stats}");
     assert_eq!(stats["curve"][0]["day"], 1, "{stats}");
     assert_eq!(stats["curve"][0]["survival"], 0.0, "{stats}");
+    let slices = report["curve_slices"].as_array().unwrap();
+    let model = slices
+        .iter()
+        .find(|slice| slice["dimension"] == "model")
+        .expect("model slice");
+    assert_eq!(model["label"], "unlinked", "{model}");
+    assert_eq!(model["spans"], 1, "{model}");
+    assert_eq!(model["deaths"], 1, "{model}");
+    let week = slices
+        .iter()
+        .find(|slice| slice["dimension"] == "commit_week")
+        .expect("commit week slice");
+    assert_eq!(week["spans"], 1, "{week}");
 }
 
 #[test]

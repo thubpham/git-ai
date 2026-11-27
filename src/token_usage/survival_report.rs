@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::cost::price_entry;
-use super::facts_db::{CostCall, FactsDatabase, FileSurvival, LossShare, SliceDimension};
+use super::facts_db::{
+    CostCall, FactsDatabase, FileSurvival, LossShare, SliceDimension, SpanHistory,
+};
 use super::survival::{Horizon, SurvivalAnchor};
 use super::survival_stats::{
-    DAY_SECS, Lifetime, kaplan_meier, lifetime, rmst, session_bootstrap, survival_at,
+    DAY_SECS, Lifetime, commit_week, kaplan_meier, lifetime, rmst, session_bootstrap, survival_at,
 };
 use super::types::{PricingShape, Speed, TokenCounts, UsageEntry};
 use crate::error::GitAiError;
@@ -32,6 +34,7 @@ pub struct SurvivalReport {
     pub cost: Option<Vec<CostRow>>,
     pub stats: Option<SurvivalStats>,
     pub weightings: Vec<WeightingRow>,
+    pub curve_slices: Vec<CurveSlice>,
     pub quality: Quality,
 }
 
@@ -162,6 +165,23 @@ pub struct SensitivityRow {
     pub rmst_14: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveDimension {
+    Model,
+    CommitWeek,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurveSlice {
+    pub dimension: CurveDimension,
+    pub label: String,
+    pub spans: i64,
+    pub deaths: i64,
+    pub followed_days: f64,
+    pub curve: Vec<CurveRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeightingRow {
     pub horizon: Horizon,
@@ -197,6 +217,7 @@ impl SurvivalReport {
             cost: None,
             stats: None,
             weightings: Vec::new(),
+            curve_slices: Vec::new(),
             quality: Quality {
                 spans: 0,
                 pinned: 0,
@@ -211,6 +232,7 @@ impl SurvivalReport {
     pub fn build(db: &FactsDatabase, now: i64) -> Result<SurvivalReport, GitAiError> {
         let totals = db.span_totals()?;
         let commit_rate = db.commit_rate()?;
+        let histories = db.committed_span_histories()?;
         let loss = db.loss()?;
         let quality = db.span_quality()?;
         let mut slices: Vec<SliceGroup> = Vec::new();
@@ -287,7 +309,8 @@ impl SurvivalReport {
             slices,
             examples,
             cost: cost_rows(db)?,
-            stats: survival_stats(db, now)?,
+            stats: survival_stats(&histories, now),
+            curve_slices: curve_slices(&histories, now),
             weightings: db
                 .retention_weightings()?
                 .into_iter()
@@ -319,10 +342,72 @@ fn ratio(surviving: i64, total: i64) -> f64 {
     surviving as f64 / total as f64
 }
 
-fn survival_stats(db: &FactsDatabase, now: i64) -> Result<Option<SurvivalStats>, GitAiError> {
-    let histories = db.committed_span_histories()?;
+fn watched_days<'a>(histories: impl Iterator<Item = &'a SpanHistory>, now: i64) -> f64 {
+    histories
+        .map(|history| (now - history.pinned_at).max(0) as f64 / DAY_SECS)
+        .fold(0.0, f64::max)
+}
+
+fn curve_rows(lifetimes: &[Lifetime], followed_days: f64) -> Vec<CurveRow> {
+    let curve = kaplan_meier(lifetimes);
+    CURVE_DAYS
+        .into_iter()
+        .filter(|&day| f64::from(day) <= followed_days)
+        .map(|day| {
+            let at = f64::from(day);
+            let (low, high) =
+                session_bootstrap(lifetimes, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, |sample| {
+                    survival_at(&kaplan_meier(sample), at)
+                });
+            CurveRow {
+                day,
+                survival: survival_at(&curve, at),
+                low,
+                high,
+            }
+        })
+        .collect()
+}
+
+fn curve_slices(histories: &[SpanHistory], now: i64) -> Vec<CurveSlice> {
+    let mut groups: BTreeMap<(CurveDimension, String), Vec<&SpanHistory>> = BTreeMap::new();
+    for history in histories {
+        let model = history
+            .model
+            .clone()
+            .unwrap_or_else(|| "unlinked".to_string());
+        groups
+            .entry((CurveDimension::Model, model))
+            .or_default()
+            .push(history);
+        groups
+            .entry((CurveDimension::CommitWeek, commit_week(history.pinned_at)))
+            .or_default()
+            .push(history);
+    }
+    groups
+        .into_iter()
+        .map(|((dimension, label), members)| {
+            let lifetimes: Vec<Lifetime> = members
+                .iter()
+                .map(|history| lifetime(history, DEATH_THRESHOLD, now))
+                .collect();
+            let followed_days = watched_days(members.iter().copied(), now);
+            CurveSlice {
+                dimension,
+                label,
+                spans: lifetimes.len() as i64,
+                deaths: lifetimes.iter().filter(|lifetime| lifetime.died).count() as i64,
+                followed_days,
+                curve: curve_rows(&lifetimes, followed_days),
+            }
+        })
+        .collect()
+}
+
+fn survival_stats(histories: &[SpanHistory], now: i64) -> Option<SurvivalStats> {
     if histories.is_empty() {
-        return Ok(None);
+        return None;
     }
     let lifetimes_at = |threshold: f64| -> Vec<Lifetime> {
         histories
@@ -331,29 +416,13 @@ fn survival_stats(db: &FactsDatabase, now: i64) -> Result<Option<SurvivalStats>,
             .collect()
     };
     let lifetimes = lifetimes_at(DEATH_THRESHOLD);
-    let followed_days = histories
-        .iter()
-        .map(|history| (now - history.pinned_at).max(0) as f64 / DAY_SECS)
-        .fold(0.0, f64::max);
+    let followed_days = watched_days(histories.iter(), now);
     let curve = kaplan_meier(&lifetimes);
     let reached = |day: u32| f64::from(day) <= followed_days;
     let range = |statistic: &dyn Fn(&[Lifetime]) -> f64| {
         session_bootstrap(&lifetimes, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, statistic)
     };
-    let curve_rows = CURVE_DAYS
-        .into_iter()
-        .filter(|&day| reached(day))
-        .map(|day| {
-            let at = f64::from(day);
-            let (low, high) = range(&|sample| survival_at(&kaplan_meier(sample), at));
-            CurveRow {
-                day,
-                survival: survival_at(&curve, at),
-                low,
-                high,
-            }
-        })
-        .collect();
+    let curve_rows = curve_rows(&lifetimes, followed_days);
     let rmst_rows = RMST_DAYS
         .into_iter()
         .filter(|&day| reached(day))
@@ -381,7 +450,7 @@ fn survival_stats(db: &FactsDatabase, now: i64) -> Result<Option<SurvivalStats>,
             }
         })
         .collect();
-    Ok(Some(SurvivalStats {
+    Some(SurvivalStats {
         threshold: DEATH_THRESHOLD,
         spans: lifetimes.len() as i64,
         deaths: lifetimes.iter().filter(|lifetime| lifetime.died).count() as i64,
@@ -389,7 +458,7 @@ fn survival_stats(db: &FactsDatabase, now: i64) -> Result<Option<SurvivalStats>,
         curve: curve_rows,
         rmst: rmst_rows,
         sensitivity,
-    }))
+    })
 }
 
 fn cost_rows(db: &FactsDatabase) -> Result<Option<Vec<CostRow>>, GitAiError> {
@@ -786,6 +855,33 @@ mod tests {
     }
 
     #[test]
+    fn building_slices_the_curve_by_model_and_commit_week() {
+        let (_dir, db) = measured_db();
+
+        let report = SurvivalReport::build(&db, 3000 + 2 * DAY).unwrap();
+
+        let slices: Vec<(CurveDimension, &str, i64, usize)> = report
+            .curve_slices
+            .iter()
+            .map(|slice| {
+                (
+                    slice.dimension,
+                    slice.label.as_str(),
+                    slice.spans,
+                    slice.curve.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            slices,
+            vec![
+                (CurveDimension::Model, "unlinked", 2, 1),
+                (CurveDimension::CommitWeek, "1969-12-29", 2, 1),
+            ]
+        );
+    }
+
+    #[test]
     fn an_empty_database_has_no_survival_statistics() {
         let (_dir, db) = db();
 
@@ -793,5 +889,6 @@ mod tests {
 
         assert_eq!(report.stats, None);
         assert!(report.weightings.is_empty());
+        assert!(report.curve_slices.is_empty());
     }
 }

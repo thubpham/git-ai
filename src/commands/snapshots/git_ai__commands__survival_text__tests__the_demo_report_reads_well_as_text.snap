@@ -40,6 +40,15 @@ Share of committed spans still alive at each age after their commit. A span dies
   Average lifetime: 11.4 of the first 14 days  (10.8–11.9)
   Average lifetime: 21.6 of the first 30 days  (20.1–23.0)
 
+  By model                  spans   died  day 1  day 7 day 30
+  model-a                     684    214    92%    76%    61%
+  model-b                     418    104    95%    83%    69%
+
+  By commit week            spans   died  day 1  day 7 day 30
+  2026-10-19                  356    131    90%    73%    58%
+  2026-10-26                  741    186    94%    82%    67%
+  2026-11-23                    5      1    80%      –      –  too few
+
   Other death thresholds:
     lost at least  25%      451 died   alive at day 7  70%   average over 14 days 10.6 days
     lost at least  50%      318 died   alive at day 7  79%   average over 14 days 11.4 days

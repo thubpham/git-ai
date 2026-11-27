@@ -1,9 +1,9 @@
 use super::facts_db::SliceDimension;
 use super::survival::{Horizon, SurvivalAnchor};
 use super::survival_report::{
-    CommitRate, CostRow, CurveRow, DEATH_THRESHOLD, ExampleGroup, FileRow, HorizonRow, LossReport,
-    LossRow, Quality, RmstRow, SensitivityRow, SliceGroup, SliceRowOut, SurvivalReport,
-    SurvivalStats, Totals, WeightingRow,
+    CommitRate, CostRow, CurveDimension, CurveRow, CurveSlice, DEATH_THRESHOLD, ExampleGroup,
+    FileRow, HorizonRow, LossReport, LossRow, Quality, RmstRow, SensitivityRow, SliceGroup,
+    SliceRowOut, SurvivalReport, SurvivalStats, Totals, WeightingRow,
 };
 
 const AVERAGE_SPAN_BYTES: i64 = 6000;
@@ -227,6 +227,72 @@ fn survival_stats() -> SurvivalStats {
     }
 }
 
+fn curve_slices() -> Vec<CurveSlice> {
+    let slice = |dimension: CurveDimension,
+                 label: &str,
+                 spans: i64,
+                 deaths: i64,
+                 followed_days: f64,
+                 points: &[(u32, f64)]| CurveSlice {
+        dimension,
+        label: label.to_string(),
+        spans,
+        deaths,
+        followed_days,
+        curve: points
+            .iter()
+            .map(|&(day, survival)| CurveRow {
+                day,
+                survival,
+                low: (survival - 0.06).max(0.0),
+                high: (survival + 0.05).min(1.0),
+            })
+            .collect(),
+    };
+    vec![
+        slice(
+            CurveDimension::Model,
+            "model-a",
+            684,
+            214,
+            41.0,
+            &[(1, 0.92), (3, 0.84), (7, 0.76), (14, 0.69), (30, 0.61)],
+        ),
+        slice(
+            CurveDimension::Model,
+            "model-b",
+            418,
+            104,
+            41.0,
+            &[(1, 0.95), (3, 0.89), (7, 0.83), (14, 0.77), (30, 0.69)],
+        ),
+        slice(
+            CurveDimension::CommitWeek,
+            "2026-10-19",
+            356,
+            131,
+            41.0,
+            &[(1, 0.90), (3, 0.82), (7, 0.73), (14, 0.66), (30, 0.58)],
+        ),
+        slice(
+            CurveDimension::CommitWeek,
+            "2026-10-26",
+            741,
+            186,
+            34.0,
+            &[(1, 0.94), (3, 0.88), (7, 0.82), (14, 0.75), (30, 0.67)],
+        ),
+        slice(
+            CurveDimension::CommitWeek,
+            "2026-11-23",
+            5,
+            1,
+            3.0,
+            &[(1, 0.80), (3, 0.80)],
+        ),
+    ]
+}
+
 fn weighting_rows() -> Vec<WeightingRow> {
     vec![
         WeightingRow {
@@ -321,6 +387,7 @@ impl SurvivalReport {
             cost: Some(cost_rows()),
             stats: Some(survival_stats()),
             weightings: weighting_rows(),
+            curve_slices: curve_slices(),
             quality: Quality {
                 spans: 1284,
                 pinned: 1102,
